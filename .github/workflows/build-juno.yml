@@ -1,0 +1,131 @@
+# Builds the Juno installer on GitHub's servers — nothing is installed on your PC.
+#
+# Runs when files that need a new installer change (Python runtime/libraries, the AI engine, the launcher or
+# this build setup), or by hand: Actions tab ▸ "Build Juno installer" ▸ Run workflow. Each run publishes a
+# release tagged juno-build-N, which Juno's "Download & install" update button uses.
+#
+# Juno's own code (juno/juno_app), integrations and characters do NOT need a new installer — Juno pulls
+# those straight from the repo (Settings ▸ Updates).
+
+name: Build Juno installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "juno/requirements.txt"
+      - "juno/launcher.py"
+      - "juno/build/**"
+      - "juno/assets/**"
+      - "build/fetch_engines.ps1"
+      - ".github/workflows/build-juno.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-juno
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Disable line-ending conversion
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: juno/requirements.txt
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r juno/requirements.txt
+          python -c "import sherpa_onnx, sounddevice, numpy, customtkinter; print('sherpa-onnx', sherpa_onnx.__version__)"
+
+      - name: Fetch the AI engine (llama.cpp)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./build/fetch_engines.ps1 -Only llama -OutDir juno/bin
+
+      - name: Write build_info.json
+        shell: pwsh
+        run: |
+          $files = [ordered]@{}
+          foreach ($line in (git ls-files -s)) {
+            $meta, $path = $line -split "`t", 2
+            $files[$path] = ($meta -split " ")[1]
+          }
+          $v = (Select-String -Path juno/juno_app/app.py -Pattern '^APP_VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          $info = [ordered]@{
+            repo    = "${{ github.repository }}"
+            branch  = "${{ github.ref_name }}"
+            build   = ${{ github.run_number }}
+            version = $v
+            commit  = "${{ github.sha }}"
+            files   = $files
+          }
+          $info | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 juno/build_info.json
+          "JUNO_VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Build Juno with PyInstaller
+        shell: pwsh
+        run: pyinstaller --noconfirm --clean juno/build/juno.spec
+
+      - name: Smoke test (frozen Juno starts, loads its brain engine path and integrations)
+        shell: pwsh
+        run: |
+          $test = Join-Path $env:RUNNER_TEMP "juno-test"
+          Copy-Item dist/Juno $test -Recurse -Force
+          New-Item -ItemType Directory -Force (Join-Path $test "core") | Out-Null
+          Copy-Item juno/juno_app (Join-Path $test "core\juno_app") -Recurse -Force
+          Copy-Item juno/bin (Join-Path $test "bin") -Recurse -Force
+          $p = Start-Process -FilePath (Join-Path $test "Juno.exe") -PassThru
+          Start-Sleep -Seconds 25
+          $log = Join-Path $env:APPDATA "Juno\logs\juno.log"
+          $text = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Write-Host $text
+          $launcher = Join-Path $env:APPDATA "Juno\logs\launcher.log"
+          if (Test-Path $launcher) { Get-Content $launcher -Raw | Write-Host; throw "juno_app failed to load" }
+          foreach ($needle in @("Starting Juno", "tkdnd")) {
+            if ($text -notmatch [regex]::Escape($needle)) { throw "Smoke test failed: '$needle' not in log" }
+          }
+          if ($text -match "Startup failed|Unhandled exception") { throw "Smoke test failed: errors in log" }
+          & (Join-Path $test "bin\llama-cpu\llama-server.exe") --version
+          if ($LASTEXITCODE -ne 0) { throw "bundled llama-server doesn't run" }
+
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc "/DAppVersion=$env:JUNO_VERSION" juno/build/juno.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Juno-Setup-${{ env.JUNO_VERSION }}-build${{ github.run_number }}
+          path: juno/build/Output/*.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: juno-build-${{ github.run_number }}
+          name: Juno ${{ env.JUNO_VERSION }} (build ${{ github.run_number }})
+          make_latest: false
+          body: |
+            Installer for Juno ${{ env.JUNO_VERSION }}, build ${{ github.run_number }}.
+            Already installed? Juno updates itself from Settings ▸ Updates — you don't need this file.
+          files: |
+            juno/build/Output/*.exe
+            juno/extras/characters/*.mtchar
