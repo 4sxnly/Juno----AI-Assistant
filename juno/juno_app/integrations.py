@@ -128,6 +128,12 @@ class Integration:
     def on_settings_changed(self) -> None:
         pass
 
+    def on_start(self) -> None:
+        """Called when the integration is loaded and switched on (start background watchers here)."""
+
+    def on_stop(self) -> None:
+        """Called when it's switched off, reloaded, or Juno closes."""
+
 
 class IntegrationAPI:
     """What integrations can use. Thread-safe unless noted."""
@@ -459,6 +465,7 @@ class Registry:
         return d
 
     def load(self) -> None:
+        self.stop_all()
         self.items.clear()
         self.errors.clear()
         for cls in BUILTINS:
@@ -478,6 +485,19 @@ class Registry:
                         self.errors[path.name] = str(exc)
                         self.core.ctx.log.warning("Integration %s failed to load: %s", path.name, exc)
         self.compile()
+        for integ in self.items.values():
+            if self.enabled(integ):
+                self._lifecycle(integ, "on_start")
+
+    def _lifecycle(self, integ: Integration, hook: str) -> None:
+        try:
+            getattr(integ, hook)()
+        except Exception as exc:  # noqa: BLE001
+            self.core.ctx.log.warning("%s.%s failed: %s", integ.id, hook, exc)
+
+    def stop_all(self) -> None:
+        for integ in self.items.values():
+            self._lifecycle(integ, "on_stop")
 
     def _add(self, integ: Integration) -> None:
         integ.bind(self.api)
@@ -491,6 +511,8 @@ class Registry:
     def set_enabled(self, integ_id: str, value: bool) -> None:
         self.api.set(integ_id, "_enabled", bool(value))
         self.compile()
+        if integ_id in self.items:
+            self._lifecycle(self.items[integ_id], "on_start" if value else "on_stop")
 
     PRIORITY = {"phrases": 3, "apps": 0}
 
@@ -821,268 +843,15 @@ class Media(Integration):
     def actions(self) -> list[Action]:
         k = lambda combo, msg: (lambda api, p: (api.keys(combo), ActionResult(msg, say=""))[1])  # noqa: E731
         return [
-            Action("play_pause", "Play / pause", ["(pause|resume|unpause) [the] (music|song|video|track|playback)",
-                                                   "(pause|resume|unpause)", "play [the] music", "play some music",
-                                                   "stop [the] music"], k("media_play_pause", "Play/pause."),
+            Action("play_pause", "Play / pause", ["(pause|resume|unpause|play) [the] (music|song|video|track|playback)",
+                                                   "(pause|resume|unpause|play)", "stop [the] music", "keep playing"],
+                   k("media_play_pause", "Play/pause."),
                    background=False),
             Action("next", "Next track", ["(next|skip) [this] [song|track]", "skip it", "play the next song"],
                    k("media_next", "Skipped."), background=False),
             Action("prev", "Previous track", ["(previous|last|go back a) (song|track)", "play the previous song"],
                    k("media_prev", "Previous track."), background=False),
         ]
-
-
-class Spotify(Integration):
-    id, name, icon, category = "spotify", "Spotify", "♫", "Music"
-    aliases = ["spotify"]
-    description = ("Open Spotify, play / pause / skip. Connect your account (Premium) to play any song, artist or "
-                   "playlist by name and set Spotify's own volume.")
-    fields = [Field("client_id", "Spotify app Client ID", help="developer.spotify.com ▸ Dashboard ▸ Create app. "
-                    "Redirect URI: http://127.0.0.1:8737/callback (Web API). Paste the Client ID here, then Connect.")]
-    REDIRECT = "http://127.0.0.1:8737/callback"
-    SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
-
-    def actions(self) -> list[Action]:
-        return [
-            Action("open", "Open Spotify", [f"{OPEN} spotify"], self.open_app),
-            Action("play", "Play something", ["play {query} on spotify", "spotify play {query}",
-                                               "play {query} (in|from|with) spotify",
-                                               "put on {query} (on|in) spotify"], self.play,
-                   params={"query": "song, artist, album or playlist"}, examples=["play lofi beats on spotify"]),
-            Action("resume", "Play / pause Spotify", ["(pause|resume|play|unpause) spotify",
-                                                       "spotify (pause|resume|play)"], self.toggle),
-            Action("next", "Next song", ["(next|skip) [song|track] on spotify", "spotify (next|skip)"], self.next),
-            Action("prev", "Previous song", ["previous [song|track] on spotify", "spotify (previous|back)"],
-                   self.prev),
-            Action("volume", "Spotify volume", ["(set|put|turn) spotify volume to {amount:num} [percent|%]",
-                                                 "spotify volume [to] {amount:num} [percent|%]"], self.volume,
-                   params={"amount": "0-100"}),
-            Action("current", "What's playing", ["what's playing on spotify", "what song is this",
-                                                  "what's this song", "what's playing"], self.current),
-        ]
-
-    # ── account (PKCE, no secret needed) ─────────────────────────────────
-    def connected(self) -> bool:
-        return bool(self.api and self.api.secret(self.id, "refresh_token"))
-
-    def status(self) -> tuple[str, str]:
-        if self.connected():
-            return "Connected", "success"
-        return ("Ready · account not connected", "muted") if self.setting("client_id") else ("Ready", "success")
-
-    def connect(self, on_done: Callable[[str | None], None]) -> None:
-        """Opens the Spotify login in the browser and waits for the redirect. Calls on_done(error or None)."""
-        import base64
-        import hashlib
-        import http.server
-        import secrets
-        client_id = (self.setting("client_id") or "").strip()
-        if not client_id:
-            on_done("Paste your Spotify Client ID first.")
-            return
-        verifier = secrets.token_urlsafe(64)[:96]
-        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-        state = secrets.token_urlsafe(16)
-        result: dict[str, str] = {}
-
-        reasons = {
-            "access_denied": "Spotify said access was denied — you pressed Cancel, or this Spotify account isn't "
-                             "listed under User Management on your Spotify developer app.",
-            "invalid_client": "Spotify doesn't recognise that Client ID — copy it again from the app's Basic "
-                              "Information.",
-            "stale": "That sign-in tab came from an earlier attempt — press Connect again and use the new tab.",
-        }
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, *a: Any) -> None:
-                pass
-
-            def do_GET(self) -> None:
-                url = urllib.parse.urlparse(self.path)
-                if url.path != "/callback":            # favicon etc.
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                query = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
-                if query.get("state") != state:
-                    result.setdefault("error", "stale")
-                elif "code" in query:
-                    result["code"] = query["code"]
-                else:
-                    result["error"] = query.get("error", "no_code")
-                    result["detail"] = query.get("error_description", "")
-                ok = "code" in result
-                if ok:
-                    title, text = "Juno is connected to Spotify", "You can close this tab."
-                else:
-                    title = "Spotify sign-in didn't finish"
-                    text = reasons.get(result["error"], f"Spotify said: {result['error']} "
-                                                        f"{result.get('detail', '')}".strip())
-                html = ("<html><body style='background:#010805;color:#39ff7a;font-family:Consolas,monospace;"
-                        "padding:48px'><h2>&gt; " + title + "</h2><p style='color:#b8ffcc;font-size:16px'>"
-                        + text.replace("<", "&lt;") + "</p></body></html>")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(html.encode("utf-8"))
-
-        previous = getattr(self, "_login_cancel", None)
-        if previous is not None:
-            previous.set()   # a second Connect press replaces the first attempt
-        cancel = self._login_cancel = threading.Event()
-
-        def work() -> None:
-            server = None
-            for _ in range(8):   # give a previous attempt a moment to let go of the port
-                try:
-                    server = http.server.HTTPServer(("127.0.0.1", 8737), Handler)
-                    break
-                except OSError:
-                    time.sleep(0.5)
-            if server is None:
-                self.api.ctx.call_in_ui(on_done, "Port 8737 is in use by another program — close it and try again.")
-                return
-            server.timeout = 0.5
-            self.api.log.info("Spotify sign-in started (redirect %s)", self.REDIRECT)
-            webbrowser.open("https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
-                "client_id": client_id, "response_type": "code", "redirect_uri": self.REDIRECT, "scope": self.SCOPES,
-                "code_challenge_method": "S256", "code_challenge": challenge, "state": state, "show_dialog": "true"}))
-            end = time.time() + 300
-            while time.time() < end and not cancel.is_set() and "code" not in result and "error" not in result:
-                server.handle_request()
-            server.server_close()
-            if cancel.is_set() and "code" not in result:
-                return
-            if "code" not in result:
-                error = result.get("error")
-                message = reasons.get(error, f"Spotify said: {error} {result.get('detail', '')}".strip()) \
-                    if error else "Timed out waiting for the Spotify sign-in (5 minutes)."
-                self.api.log.warning("Spotify sign-in failed: %s %s", error, result.get("detail", ""))
-                self.api.ctx.call_in_ui(on_done, message)
-                return
-            try:
-                self._token({"grant_type": "authorization_code", "code": result["code"],
-                             "redirect_uri": self.REDIRECT, "client_id": client_id, "code_verifier": verifier})
-                self.api.ctx.call_in_ui(on_done, None)
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", "replace")[:300]
-                self.api.log.warning("Spotify token exchange failed: %s %s", exc.code, body)
-                self.api.ctx.call_in_ui(on_done, f"Spotify refused the sign-in ({exc.code}): {body}")
-            except Exception as exc:
-                self.api.ctx.call_in_ui(on_done, str(exc))
-        threading.Thread(target=work, daemon=True, name="spotify-login").start()
-
-    def disconnect(self) -> None:
-        self.api.set_secret(self.id, "refresh_token", "")
-        self._access = None
-
-    _access: tuple[str, float] | None = None
-
-    def _token(self, form: dict[str, str]) -> str:
-        req = urllib.request.Request("https://accounts.spotify.com/api/token",
-                                     data=urllib.parse.urlencode(form).encode(),
-                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-        if data.get("refresh_token"):
-            self.api.set_secret(self.id, "refresh_token", data["refresh_token"])
-        self._access = (data["access_token"], time.time() + int(data.get("expires_in", 3600)) - 60)
-        return self._access[0]
-
-    def _bearer(self) -> str:
-        if self._access and self._access[1] > time.time():
-            return self._access[0]
-        refresh = self.api.secret(self.id, "refresh_token")
-        if not refresh:
-            raise PermissionError("not connected")
-        return self._token({"grant_type": "refresh_token", "refresh_token": refresh,
-                            "client_id": (self.setting("client_id") or "").strip()})
-
-    def _call(self, method: str, path: str, body: Any = None, query: dict[str, Any] | None = None) -> Any:
-        url = "https://api.spotify.com/v1" + path + ("?" + urllib.parse.urlencode(query) if query else "")
-        data = json.dumps(body).encode() if body is not None else (b"" if method in ("PUT", "POST") else None)
-        req = urllib.request.Request(url, data=data, method=method, headers={
-            "Authorization": "Bearer " + self._bearer(), "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw = resp.read()
-                return json.loads(raw) if raw else None
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                raise RuntimeError("Spotify isn't playing on any device — open Spotify first.") from None
-            if exc.code == 403:
-                raise RuntimeError("Spotify only lets Premium accounts be controlled this way.") from None
-            raise RuntimeError(f"Spotify said {exc.code}.") from None
-
-    # ── actions ──────────────────────────────────────────────────────────
-    def open_app(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        api.open_uri("spotify:")
-        return ActionResult("Opened Spotify.")
-
-    def play(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        query = params.get("query", "").strip()
-        if not self.connected():
-            api.open_uri("spotify:search:" + urllib.parse.quote(query))
-            return ActionResult(f"Searched Spotify for “{query}”. Connect your Spotify account on the Integrations "
-                                f"page and I'll press play for you too.", say=f"Here's {query} on Spotify.")
-        kind = "playlist" if "playlist" in query.lower() else "album" if " album" in query.lower() else None
-        clean = re.sub(r"\b(the )?(playlist|album|song|track)\b", "", query, flags=re.I).strip() or query
-        found = self._call("GET", "/search", query={"q": clean, "type": kind or "track,artist,playlist", "limit": 1})
-        if kind:
-            items = (found.get(kind + "s") or {}).get("items") or []
-            item = next((i for i in items if i), None)
-            body = {"context_uri": item["uri"]} if item else None
-        else:
-            track = next((i for i in (found.get("tracks") or {}).get("items") or [] if i), None)
-            artist = next((i for i in (found.get("artists") or {}).get("items") or [] if i), None)
-            if artist and artist["name"].lower() == clean.lower():
-                item, body = artist, {"context_uri": artist["uri"]}
-            elif track:
-                item, body = track, {"uris": [track["uri"]]}
-            else:
-                pl = next((i for i in (found.get("playlists") or {}).get("items") or [] if i), None)
-                item, body = pl, ({"context_uri": pl["uri"]} if pl else None)
-        if not body:
-            return ActionResult(f"Spotify found nothing for “{query}”.", ok=False)
-        self._call("PUT", "/me/player/play", body)
-        name = item.get("name", query)
-        by = ", ".join(a["name"] for a in item.get("artists", [])[:2])
-        return ActionResult(f"Playing {name}" + (f" by {by}" if by else "") + " on Spotify.")
-
-    def toggle(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        if self.connected():
-            state = self._call("GET", "/me/player") or {}
-            self._call("PUT", "/me/player/pause" if state.get("is_playing") else "/me/player/play")
-            return ActionResult("Paused Spotify." if state.get("is_playing") else "Resumed Spotify.", say="")
-        api.keys("media_play_pause")
-        return ActionResult("Play/pause.", say="")
-
-    def next(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        self._call("POST", "/me/player/next") if self.connected() else api.keys("media_next")
-        return ActionResult("Skipped.", say="")
-
-    def prev(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        self._call("POST", "/me/player/previous") if self.connected() else api.keys("media_prev")
-        return ActionResult("Previous track.", say="")
-
-    def volume(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        if not self.connected():
-            return ActionResult("Connect your Spotify account first (Integrations page) — or say “set volume to "
-                                "40%” for the PC volume.", ok=False)
-        m = re.search(r"\d+", params.get("amount", ""))
-        level = max(0, min(100, int(m.group()))) if m else 50
-        self._call("PUT", "/me/player/volume", query={"volume_percent": level})
-        return ActionResult(f"Spotify volume {level}%.", say="")
-
-    def current(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        if not self.connected():
-            return ActionResult("Connect your Spotify account (Integrations page) and I can tell you.", ok=False)
-        now = self._call("GET", "/me/player/currently-playing") or {}
-        item = now.get("item")
-        if not item:
-            return ActionResult("Nothing's playing right now.")
-        by = ", ".join(a["name"] for a in item.get("artists", [])[:2])
-        return ActionResult(f"That's {item['name']}" + (f" by {by}." if by else "."))
 
 
 class Google(Integration):
@@ -1146,61 +915,6 @@ class Google(Integration):
             raise LookupError("not a website")   # let other commands (e.g. "open notepad") handle it
         api.open_url(site if "://" in site else "https://" + site)
         return ActionResult(f"Opened {site}.")
-
-
-class Discord(Integration):
-    id, name, icon, category = "discord", "Discord", "✉", "Social"
-    aliases = ["discord"]
-    description = "Open Discord or your DMs, and read out your latest Discord messages (from Windows notifications)."
-
-    def actions(self) -> list[Action]:
-        return [
-            Action("open", "Open Discord", [f"{OPEN} discord"],
-                   lambda api, p: (api.open_uri("discord://-/channels/@me"), ActionResult("Opened Discord."))[1]),
-            Action("dms", "Open my DMs", [f"{OPEN} [my] (discord dms|discord messages|dms)", "go to my dms"],
-                   lambda api, p: (api.open_uri("discord://-/channels/@me"), ActionResult("Opened your DMs."))[1]),
-            Action("unread", "Read my latest messages", ["(any|do i have) (new|unread) discord messages",
-                                                         "read my discord messages", "check discord",
-                                                         "who messaged me on discord", "what's new on discord"],
-                   self.latest),
-        ]
-
-    def latest(self, api: IntegrationAPI, params: dict[str, str]) -> ActionResult:
-        messages = recent_discord_notifications(5)
-        if messages is None:
-            return ActionResult("I can't read Windows' notification list on this PC.", ok=False)
-        if not messages:
-            return ActionResult("No recent Discord messages.")
-        lines = [f"{who}: {what}" for who, what in messages]
-        spoken = "; ".join(f"{who} said {what}" for who, what in messages[:3])
-        return ActionResult("Latest Discord messages —\n" + "\n".join(lines), say=spoken)
-
-
-def recent_discord_notifications(limit: int = 5) -> list[tuple[str, str]] | None:
-    import sqlite3
-    import xml.etree.ElementTree as ET
-    db = os.environ.get("MT_WPN_DB") or (Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "Windows" /
-                                         "Notifications" / "wpndatabase.db")
-    if not Path(db).exists():
-        return None
-    con = sqlite3.connect(f"file:{Path(db).as_posix()}?mode=ro", uri=True, timeout=2)
-    try:
-        rows = con.execute("SELECT n.Payload FROM Notification n JOIN NotificationHandler h ON n.HandlerId = "
-                           "h.RecordId WHERE n.Type='toast' AND lower(h.PrimaryId) LIKE '%discord%' "
-                           "ORDER BY n.Id DESC LIMIT ?", (limit,)).fetchall()
-    finally:
-        con.close()
-    out = []
-    for (payload,) in rows:
-        try:
-            root = ET.fromstring(payload.decode("utf-8", "replace") if isinstance(payload, bytes) else payload)
-            texts = [(t.text or "").strip() for t in root.iter("text") if t.get("placement") != "attribution"]
-        except Exception:
-            continue
-        if texts:
-            who = re.sub(r"\s+\(.*\)$", "", texts[0])
-            out.append((who, " ".join(texts[1:])[:160] or "(attachment)"))
-    return out
 
 
 class Blender(Integration):
@@ -1328,6 +1042,9 @@ class RobloxStudio(Integration):
         _startfile(str(hit))
         return ActionResult(f"Opened {hit.name} in Roblox Studio.")
 
+
+from .integ_spotify import Spotify  # noqa: E402  (they import the framework above)
+from .integ_discord import Discord, recent_discord_notifications  # noqa: E402,F401
 
 BUILTINS: list[type[Integration]] = [Phrases, Apps, System, Media, Spotify, Google, Discord, Blender, RobloxStudio]
 

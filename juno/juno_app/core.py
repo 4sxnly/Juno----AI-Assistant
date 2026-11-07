@@ -411,6 +411,10 @@ class JunoCore(E.Plugin):
         self._schedule_quip()
 
     def shutdown(self) -> None:
+        try:
+            self.integrations.stop_all()
+        except Exception:  # noqa: BLE001
+            pass
         if self._activity_save is not None:
             self._save_activity()
         super().shutdown()

@@ -848,13 +848,20 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
                 line = t.tag(ctk.CTkFrame(box, fg_color="transparent"), "transparent")
                 line.grid(row=len(integ.fields) * 2, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
                 if integ.connected():
+                    if not integ.has_library_access():
+                        ctk.CTkButton(line, text="Reconnect (to use your library)", width=230,
+                                      command=lambda: self._spotify_connect(integ)).pack(side="left", padx=(0, 8))
+                    else:
+                        t.tag(ctk.CTkButton(line, text="⟳ Refresh library", width=140,
+                                            command=lambda: self._spotify_refresh(integ)), "secondary").pack(
+                            side="left", padx=(0, 8))
                     t.tag(ctk.CTkButton(line, text="Disconnect Spotify", width=160,
                                         command=lambda: (integ.disconnect(), self._rebuild("integrations"))),
                           "ghost").pack(side="left")
                 else:
                     ctk.CTkButton(line, text="Connect Spotify account", width=200,
                                   command=lambda: self._spotify_connect(integ)).pack(side="left")
-                t.tag(ctk.CTkLabel(line, text="Optional · needs Spotify Premium to control playback.", anchor="w"),
+                t.tag(ctk.CTkLabel(line, text="Needs Spotify Premium. Your Liked Songs and playlists are searched first.", anchor="w"),
                       "muted").pack(side="left", padx=10)
 
     def _field_row(self, box: Any, n: int, integ: Any, f: Field) -> None:
@@ -868,6 +875,21 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
             ctk.CTkSwitch(box, text="", variable=var,
                           command=lambda: (api.set(integ.id, f.key, var.get()), integ.on_settings_changed())).grid(
                 row=i, column=1, sticky="w", pady=(8, 0))
+            return
+        if f.kind == "choice":
+            current = str(value) if str(value) in f.choices else (f.default or (f.choices[0] if f.choices else ""))
+
+            def chose(v: str) -> None:
+                api.set(integ.id, f.key, v)
+                integ.on_settings_changed()
+                self.set_status(f"{integ.name}: {f.label} → {v}", "success")
+                self._rebuild("integrations")
+            menu = ctk.CTkOptionMenu(box, values=list(f.choices) or [current], command=chose, width=220)
+            menu.set(current)
+            menu.grid(row=i, column=1, sticky="w", pady=(8, 0))
+            if f.help:
+                t.tag(ctk.CTkLabel(box, text=f.help, anchor="w", justify="left", wraplength=620, font=t.font(10)),
+                      "muted").grid(row=i + 1, column=1, columnspan=2, sticky="ew", padx=(0, 10))
             return
         entry = ctk.CTkEntry(box, show="•" if f.kind == "secret" else "")
         entry.insert(0, api.secret(integ.id, f.key) if f.kind == "secret" else str(value or ""))
@@ -904,10 +926,23 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
                 self.set_status(f"Spotify: {error}", "error")
                 self.notify("Spotify didn't connect", error, subtitle="Integrations ▸ Spotify", icon="♫", duration=20)
             else:
-                self.set_status("Spotify connected", "success")
-                self.core.log_activity("Spotify connected", "Playback control is on", "ok", "spotify")
+                status = integ.status()[0]
+                self.set_status(f"Spotify: {status}", "success")
+                self.core.log_activity("Spotify connected", status, "ok", "spotify")
             self._rebuild("integrations")
         integ.connect(done)
+
+    def _spotify_refresh(self, integ: Spotify) -> None:
+        self.set_status("Reading your Spotify library…")
+
+        def done(lib: Any) -> None:
+            self.set_status(f"Spotify: {len(lib.get('tracks', []))} liked songs, "
+                            f"{len(lib.get('playlists', []))} playlists", "success")
+            self._rebuild("integrations")
+
+        def failed(exc: BaseException) -> None:
+            self.set_status(f"Spotify: {exc}", "error")
+        self.run_in_thread(lambda: integ.sync(full=True), on_done=done, on_error=failed, name="spotify-sync")
 
     def _add_integration(self) -> None:
         names = filedialog.askopenfilenames(parent=self, title="Add integration",
