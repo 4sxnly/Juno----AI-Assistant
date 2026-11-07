@@ -1,0 +1,139 @@
+# Builds the Windows installer on GitHub's servers — nothing is installed on your PC.
+#
+# Runs automatically when files that need a new installer change (the Python runtime, libraries,
+# bundled engines, the launcher or this build setup), or by hand from the Actions tab
+# ("Build Windows installer" → Run workflow). Every run publishes a GitHub Release, which is where
+# the app's "Download & install" update button gets new installers from.
+#
+# Plugins, themes and main.py do NOT need a new installer: the app pulls those straight
+# from the repo (Settings ▸ Updates).
+
+name: Build Multi-Tool installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "requirements.txt"
+      - "launcher.py"
+      - "build/**"
+      - "assets/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-installer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      # Keep files byte-identical to the repo (the in-app updater compares git hashes)
+      - name: Disable line-ending conversion
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Fetch engines (yt-dlp, deno, ffmpeg)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./build/fetch_engines.ps1
+
+      - name: Write build_info.json
+        shell: pwsh
+        run: |
+          $files = [ordered]@{}
+          foreach ($line in (git ls-files -s)) {
+            # "<mode> <sha> <stage>\t<path>"
+            $meta, $path = $line -split "`t", 2
+            $files[$path] = ($meta -split " ")[1]
+          }
+          $v = (Select-String -Path main.py -Pattern 'APP_VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          $info = [ordered]@{
+            repo    = "${{ github.repository }}"
+            branch  = "${{ github.ref_name }}"
+            build   = ${{ github.run_number }}
+            version = $v
+            commit  = "${{ github.sha }}"
+            files   = $files
+          }
+          $info | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 build_info.json
+          Write-Host "build $($info.build) / version $v / $($files.Count) files"
+
+      - name: Build app with PyInstaller
+        shell: pwsh
+        run: pyinstaller --noconfirm --clean build/multitool.spec
+
+      - name: Smoke test (frozen app loads plugins, drag-and-drop and engines)
+        shell: pwsh
+        run: |
+          $test = Join-Path $env:RUNNER_TEMP "mt-test"
+          Copy-Item dist/MultiTool $test -Recurse -Force
+          New-Item -ItemType Directory -Force (Join-Path $test "core") | Out-Null
+          Copy-Item main.py (Join-Path $test "core\main.py") -Force
+          Copy-Item plugins (Join-Path $test "plugins") -Recurse -Force
+          Copy-Item bin (Join-Path $test "bin") -Recurse -Force
+          $p = Start-Process -FilePath (Join-Path $test "MultiTool.exe") -PassThru
+          Start-Sleep -Seconds 25
+          $log = Join-Path $env:APPDATA "MultiTool\logs\multitool.log"
+          $text = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Write-Host $text
+          $launcher = Join-Path $env:APPDATA "MultiTool\logs\launcher.log"
+          if (Test-Path $launcher) { Get-Content $launcher -Raw | Write-Host; throw "core/main.py failed to load" }
+          foreach ($needle in @("Loaded plugin media_downloader", "Loaded plugin discord_notifier", "tkdnd")) {
+            if ($text -notmatch [regex]::Escape($needle)) { throw "Smoke test failed: '$needle' not in log" }
+          }
+          if ($text -match "Startup failed|failed to load") { throw "Smoke test failed: errors in log" }
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path main.py -Pattern 'APP_VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build installer with Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress | Out-Null
+          }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" build/installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiTool-Setup-${{ steps.ver.outputs.version }}-build${{ github.run_number }}
+          path: build/Output/*.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Multi-Tool ${{ steps.ver.outputs.version }} (build ${{ github.run_number }})
+          make_latest: true
+          body: |
+            Installer for Multi-Tool ${{ steps.ver.outputs.version }}, build ${{ github.run_number }}.
+            Already installed? The app updates itself from Settings ▸ Updates — you don't need this file.
+          files: |
+            build/Output/*.exe
+            extras/themes/*.mttheme
