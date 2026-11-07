@@ -902,6 +902,7 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
         def done(error: str | None) -> None:
             if error:
                 self.set_status(f"Spotify: {error}", "error")
+                self.notify("Spotify didn't connect", error, subtitle="Integrations ▸ Spotify", icon="♫", duration=20)
             else:
                 self.set_status("Spotify connected", "success")
                 self.core.log_activity("Spotify connected", "Playback control is on", "ok", "spotify")

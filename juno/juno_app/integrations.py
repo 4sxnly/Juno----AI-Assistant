@@ -51,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -884,42 +885,89 @@ class Spotify(Integration):
         state = secrets.token_urlsafe(16)
         result: dict[str, str] = {}
 
+        reasons = {
+            "access_denied": "Spotify said access was denied — you pressed Cancel, or this Spotify account isn't "
+                             "listed under User Management on your Spotify developer app.",
+            "invalid_client": "Spotify doesn't recognise that Client ID — copy it again from the app's Basic "
+                              "Information.",
+            "stale": "That sign-in tab came from an earlier attempt — press Connect again and use the new tab.",
+        }
+
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a: Any) -> None:
                 pass
 
             def do_GET(self) -> None:
-                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                if query.get("state", [""])[0] == state:
-                    result.update({k: v[0] for k, v in query.items()})
-                body = ("<h2 style='font-family:sans-serif'>Juno is connected to Spotify — you can close this tab."
-                        "</h2>" if "code" in result else "<h2>Spotify login didn't finish.</h2>").encode()
+                url = urllib.parse.urlparse(self.path)
+                if url.path != "/callback":            # favicon etc.
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                query = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+                if query.get("state") != state:
+                    result.setdefault("error", "stale")
+                elif "code" in query:
+                    result["code"] = query["code"]
+                else:
+                    result["error"] = query.get("error", "no_code")
+                    result["detail"] = query.get("error_description", "")
+                ok = "code" in result
+                if ok:
+                    title, text = "Juno is connected to Spotify", "You can close this tab."
+                else:
+                    title = "Spotify sign-in didn't finish"
+                    text = reasons.get(result["error"], f"Spotify said: {result['error']} "
+                                                        f"{result.get('detail', '')}".strip())
+                html = ("<html><body style='background:#010805;color:#39ff7a;font-family:Consolas,monospace;"
+                        "padding:48px'><h2>&gt; " + title + "</h2><p style='color:#b8ffcc;font-size:16px'>"
+                        + text.replace("<", "&lt;") + "</p></body></html>")
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(body)
+                self.wfile.write(html.encode("utf-8"))
+
+        previous = getattr(self, "_login_cancel", None)
+        if previous is not None:
+            previous.set()   # a second Connect press replaces the first attempt
+        cancel = self._login_cancel = threading.Event()
 
         def work() -> None:
-            try:
-                server = http.server.HTTPServer(("127.0.0.1", 8737), Handler)
-            except OSError as exc:
-                self.api.ctx.call_in_ui(on_done, f"Port 8737 is busy ({exc}).")
+            server = None
+            for _ in range(8):   # give a previous attempt a moment to let go of the port
+                try:
+                    server = http.server.HTTPServer(("127.0.0.1", 8737), Handler)
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            if server is None:
+                self.api.ctx.call_in_ui(on_done, "Port 8737 is in use by another program — close it and try again.")
                 return
-            server.timeout = 1
+            server.timeout = 0.5
+            self.api.log.info("Spotify sign-in started (redirect %s)", self.REDIRECT)
             webbrowser.open("https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
                 "client_id": client_id, "response_type": "code", "redirect_uri": self.REDIRECT, "scope": self.SCOPES,
-                "code_challenge_method": "S256", "code_challenge": challenge, "state": state}))
-            end = time.time() + 180
-            while time.time() < end and "code" not in result and "error" not in result:
+                "code_challenge_method": "S256", "code_challenge": challenge, "state": state, "show_dialog": "true"}))
+            end = time.time() + 300
+            while time.time() < end and not cancel.is_set() and "code" not in result and "error" not in result:
                 server.handle_request()
             server.server_close()
+            if cancel.is_set() and "code" not in result:
+                return
             if "code" not in result:
-                self.api.ctx.call_in_ui(on_done, result.get("error", "Timed out waiting for Spotify."))
+                error = result.get("error")
+                message = reasons.get(error, f"Spotify said: {error} {result.get('detail', '')}".strip()) \
+                    if error else "Timed out waiting for the Spotify sign-in (5 minutes)."
+                self.api.log.warning("Spotify sign-in failed: %s %s", error, result.get("detail", ""))
+                self.api.ctx.call_in_ui(on_done, message)
                 return
             try:
                 self._token({"grant_type": "authorization_code", "code": result["code"],
                              "redirect_uri": self.REDIRECT, "client_id": client_id, "code_verifier": verifier})
                 self.api.ctx.call_in_ui(on_done, None)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", "replace")[:300]
+                self.api.log.warning("Spotify token exchange failed: %s %s", exc.code, body)
+                self.api.ctx.call_in_ui(on_done, f"Spotify refused the sign-in ({exc.code}): {body}")
             except Exception as exc:
                 self.api.ctx.call_in_ui(on_done, str(exc))
         threading.Thread(target=work, daemon=True, name="spotify-login").start()
