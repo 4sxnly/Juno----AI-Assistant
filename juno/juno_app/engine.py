@@ -79,15 +79,30 @@ try:
 except Exception:
     winsound = None
 
-try:
-    import numpy as np
-except Exception:  # pragma: no cover
-    np = None
+class _LazyModule:
+    """Imports a heavy module the first time it's actually used (faster start, less memory until then)."""
 
-try:
-    import sounddevice as sd
-except Exception:  # PortAudio missing
-    sd = None
+    def __init__(self, name: str):
+        self._name = name
+        self._mod: Any = None
+
+    def __getattr__(self, attr: str) -> Any:
+        if self._mod is None:
+            import importlib
+            self._mod = importlib.import_module(self._name)
+        return getattr(self._mod, attr)
+
+
+def _lazy(name: str) -> Any:
+    import importlib.util
+    try:
+        return _LazyModule(name) if importlib.util.find_spec(name) is not None else None
+    except Exception:  # pragma: no cover
+        return None
+
+
+np = _lazy("numpy")
+sd = _lazy("sounddevice")      # PortAudio is only loaded when the mic or neural voice is first used
 
 IS_WINDOWS = sys.platform == "win32"
 TRANSPARENT_KEY = "#fe00fe"   # colour keyed out of the overlay window — never use it in art
@@ -132,10 +147,10 @@ DEFAULT_CHARACTER: dict[str, Any] = {
     "version": "1.0",
     "description": "An upbeat ex-netrunner with a neon streak, cyber-eyes and a dry sense of humour.",
     "persona": {
-        "pronouns": "she/her",
+        "pronouns": "they/them",
         "backstory": ("Juno used to patch city-grid firmware for a living and now keeps a friendly eye on "
-                      "your desktop. She loves clean code, game dev, good music and finding the one log line "
-                      "that explains everything."),
+                      "your desktop. Juno loves clean code, game dev, good music and finding the one log line "
+                      "that explains everything. Juno has no gender — the voice is whatever the user picks."),
         "speaking_style": "Casual, quick and warm, with the occasional dry joke. Plain words, never corporate.",
         "greetings": ["Hey! Systems green. What are we building today?",
                       "Back online. Shout if you need a second pair of eyes.",
@@ -144,8 +159,8 @@ DEFAULT_CHARACTER: dict[str, Any] = {
                        "That's a lot of tabs. Respect.", "If it compiles first try, I'm suspicious."],
         "defaults": {"warmth": 0.65, "sincerity": 0.5, "chattiness": 0.35, "directness": 0.6, "energy": 0.6},
     },
-    "voice": {"prefer": ["Zira", "Aria", "Jenny", "Hazel", "Susan"], "rate": 1, "pitch": 2, "volume": 90,
-              "kokoro": "af_heart", "speed": 1.1},
+    "voice": {"prefer": ["Aria", "Guy", "Jenny", "David", "Zira", "Mark"], "rate": 1, "pitch": 0, "volume": 90,
+              "kokoro": "af_heart", "natural": "alba", "speed": 1.05},
     "look": {
         "rig": "procedural",
         "scale": 1.0,
@@ -187,7 +202,7 @@ id            unique, lowercase, letters/numbers/dashes. Same id = the pack upda
 name, author, version, description
 
 persona
-  pronouns        e.g. "she/her"
+  pronouns        e.g. "they/them", "she/her", "he/him" (Juno itself is they/them)
   backstory       who they are (sent to the AI as character background)
   speaking_style  how they talk
   greetings       lines shown in a speech bubble when the app starts (if enabled)
@@ -196,11 +211,16 @@ persona
                   warmth (cool→warm), sincerity (dry→sincere), chattiness (quiet→chatty),
                   directness (gentle→direct), energy (low→lively)
 
-voice  (uses the voices installed in Windows — Settings → Time & language → Speech)
-  prefer   list of name fragments, first installed match wins, e.g. ["Zira", "Aria"] or ["David", "Mark"]
-  rate     -10..10   speed
-  pitch    -10..10
-  volume   0..100
+voice  (the user can always pick a different voice in Juno — these are the character's defaults)
+  natural  Natural (Pocket TTS) voice: one of alba, marius, javert, jean, fantine, eponine, azelma, cosette
+           — OR the name of a .wav file inside this pack (5–10 s of clear speech, e.g. "voice.wav") and Juno
+           speaks in that voice. Only use recordings you have permission to use.
+  kokoro   Kokoro voice id, e.g. "af_heart", "am_michael", "bm_george"
+  speed    0.6..1.6
+  prefer   Windows voices: list of name fragments, first installed match wins, e.g. ["Aria"] or ["Guy", "David"]
+  rate     -10..10   speed (Windows voices)
+  pitch    -10..10   (Windows voices)
+  volume   0..100    (Windows voices)
 
 look
   rig: "procedural"  — the built-in drawn body. Recolour it with any of:
@@ -293,6 +313,9 @@ def normalize_character(raw: dict[str, Any]) -> dict[str, Any]:
             voice[key] = DEFAULT_CHARACTER["voice"][key]
     if str(voice.get("kokoro", "")) not in KOKORO_SID:
         voice["kokoro"] = DEFAULT_CHARACTER["voice"]["kokoro"]
+    natural = str(voice.get("natural") or "")
+    if natural not in POCKET_LABEL and not re.fullmatch(r"[\w .()-]{1,80}\.wav", natural, re.I):
+        voice["natural"] = DEFAULT_CHARACTER["voice"]["natural"]
     try:
         voice["speed"] = round(max(0.6, min(float(voice.get("speed", 1.1)), 1.6)), 2)
     except (TypeError, ValueError):
@@ -489,8 +512,12 @@ def build_system_prompt(character: dict[str, Any], personality: dict[str, float]
         "- Start every reply with exactly one mood tag that drives your facial expression (it is hidden from "
         "the user): " + " ".join(f"[{m}]" for m in MOODS) + ".\n"
         "- You only see the screen when the user shares a screenshot. Never claim to see anything else.\n"
-        "- You cannot click, type, open apps, run commands or change anything on the computer. If asked, "
-        "explain how the user can do it themselves.\n"
+        "- You yourself can't click, type or run things. Juno's integrations do PC actions when the user says them "
+        "as commands (\"open blender\", \"play yeat\", \"search up X on firefox\", \"type hello\"); if they ask "
+        "you to do one in a roundabout way, tell them the short command to say.\n"
+        "- The user often writes casually: slang, abbreviations, typos, no punctuation (\"rn\", \"ngl\", \"fr\", "
+        "\"lowkey\", \"bet\", \"wyd\", \"idk\", \"lmk\", \"ts\", \"icl\"). Understand it without commenting on it, "
+        "and reply naturally and relaxed. You can match their vibe a little, but don't overdo slang.\n"
         "- If you can't help, say so briefly and stay in character.")
     if allow_memory:
         lines.append(
@@ -955,6 +982,25 @@ class LocalEngine:
         self.vulkan_bad = False
         self.lock = threading.Lock()
         self.log_file = plugin.ctx.data_dir / "llama-server.log"
+        self._lean: dict[str, list[str]] = {}
+
+    def _lean_flags(self, exe: Path) -> list[str]:
+        """Memory savers this llama-server build understands: no RAM prompt cache, 8-bit K cache."""
+        key = str(exe)
+        if key not in self._lean:
+            flags: list[str] = []
+            try:
+                out = subprocess.run([key, "--help"], capture_output=True, text=True, timeout=20, cwd=str(exe.parent),
+                                     **self.p.ctx.subprocess_kwargs())
+                text = (out.stdout or "") + (out.stderr or "")
+                if "--cache-ram" in text:
+                    flags += ["--cache-ram", "0"]
+                if "--cache-type-k" in text:
+                    flags += ["--cache-type-k", "q8_0"]
+            except Exception as exc:  # noqa: BLE001
+                self.p.ctx.log.info("Couldn't read llama-server options: %s", exc)
+            self._lean[key] = flags
+        return self._lean[key]
 
     def exe(self, backend: str) -> Path | None:
         path = self.p.ctx.paths.bin_dir / f"llama-{backend}" / ("llama-server.exe" if IS_WINDOWS else "llama-server")
@@ -984,20 +1030,29 @@ class LocalEngine:
                 if exe is None:
                     continue
                 on_status("Waking up the AI on your " + ("graphics card…" if backend == "vulkan" else "processor…"))
-                port = _free_port()
-                args = [str(exe), "-m", manifest["model_path"], "--host", "127.0.0.1", "--port", str(port),
-                        "-c", "8192", "-np", "1", "--jinja", "--chat-template-kwargs", '{"enable_thinking":false}',
-                        "-ngl", "99" if backend == "vulkan" else "0"]
-                if manifest.get("mmproj_path"):
-                    args += ["--mmproj", manifest["mmproj_path"]]
-                log = open(self.log_file, "w", encoding="utf-8", errors="replace")
-                try:
-                    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                            cwd=str(exe.parent), **self.p.ctx.subprocess_kwargs())
-                finally:
-                    log.close()
-                job = attach_kill_on_close(proc)
-                if self._wait_ready(proc, port, 240):
+                proc = job = port = None
+                for extra in ([*self._lean_flags(exe)], []):
+                    port = _free_port()
+                    args = [str(exe), "-m", manifest["model_path"], "--host", "127.0.0.1", "--port", str(port),
+                            "-c", "8192", "-np", "1", "--jinja", "--chat-template-kwargs",
+                            '{"enable_thinking":false}', "-ngl", "99" if backend == "vulkan" else "0", *extra]
+                    if manifest.get("mmproj_path"):
+                        args += ["--mmproj", manifest["mmproj_path"]]
+                    log = open(self.log_file, "w", encoding="utf-8", errors="replace")
+                    try:
+                        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                                cwd=str(exe.parent), **self.p.ctx.subprocess_kwargs())
+                    finally:
+                        log.close()
+                    job = attach_kill_on_close(proc)
+                    if self._wait_ready(proc, port, 240):
+                        break
+                    self._kill(proc)
+                    if not extra:
+                        break
+                    self.p.ctx.log.info("llama-server didn't like the memory-saving options; retrying without")
+                    self._lean[str(exe)] = []
+                if proc is not None and proc.poll() is None:
                     self.proc, self.job, self.port = proc, job, port
                     self.model_path, self.backend = manifest["model_path"], backend
                     self.last_used = time.monotonic()
@@ -1205,13 +1260,37 @@ def wav_envelope(path: Path, window: float = 0.03) -> tuple[list[float], float]:
 # ════════════════════════════════════════════════════════════════════════════
 
 SHERPA_RELEASES = os.environ.get("MT_SHERPA_BASE", "https://github.com/k2-fsa/sherpa-onnx/releases/download")
+HF_VOICES = os.environ.get("MT_VOICES_BASE", "https://huggingface.co/kyutai/tts-voices/resolve/main")
+# Kyutai's voice recordings that Pocket TTS clones from (the same ones its own catalog uses)
+POCKET_VOICE_FILES: list[tuple[str, str, str]] = [
+    ("alba", "alba-mackenna/casual.wav", "Alba — warm, casual · female"),
+    ("marius", "voice-donations/Selfie.wav", "Marius — relaxed · male"),
+    ("javert", "voice-donations/Butter.wav", "Javert — clear, low · male"),
+    ("jean", "ears/p010/freeform_speech_01.wav", "Jean — natural · male"),
+    ("fantine", "vctk/p244_023.wav", "Fantine — bright · female"),
+    ("eponine", "vctk/p262_023.wav", "Eponine — soft · female"),
+    ("azelma", "vctk/p303_023.wav", "Azelma — light · female"),
+    ("cosette", "expresso/ex04-ex02_confused_001_channel1_499s.wav", "Cosette — expressive · female"),
+]
+POCKET_LABEL = {key: label for key, _p, label in POCKET_VOICE_FILES}
 VOICE_ADDONS: dict[str, dict[str, Any]] = {
     "voices": {
-        "name": "Neural voices",
-        "about": "28 natural English voices (Kokoro). About 130 MB, one time — then fully offline.",
+        "name": "Kokoro voices",
+        "about": "28 lighter English voices (Kokoro) — fastest on older PCs. About 130 MB, one time.",
         "parts": [{"url": f"{SHERPA_RELEASES}/tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2",
                    "size": 132_353_410, "kind": "tar"}],
         "needs": ["model.int8.onnx", "voices.bin", "tokens.txt", "espeak-ng-data"],
+    },
+    "natural": {
+        "name": "Natural voices",
+        "about": "Kyutai Pocket TTS — the most human-sounding offline voices, male and female. About 110 MB, one "
+                 "time — then fully offline.",
+        "parts": [{"url": f"{SHERPA_RELEASES}/tts-models/sherpa-onnx-pocket-tts-int8-2026-01-26.tar.bz2",
+                   "size": 98_000_000, "kind": "tar", "keep_tests": True}] + [
+            {"url": f"{HF_VOICES}/{path}", "size": 900_000, "kind": "file", "name": f"voices/{key}.wav",
+             "optional": True} for key, path, _label in POCKET_VOICE_FILES],
+        "needs": ["lm_flow.int8.onnx", "lm_main.int8.onnx", "encoder.onnx", "decoder.int8.onnx",
+                  "text_conditioner.onnx", "vocab.json", "token_scores.json"],
     },
     "listen": {
         "name": "Voice chat",
@@ -1315,12 +1394,20 @@ class AddonManager:
             if part["kind"] == "file" and (folder / name).exists():
                 before += part["size"]
                 continue
-            target = staging / name
-            self._fetch(part["url"], target, lambda n, b=before: progress(b + n, total), cancel)
+            target = staging / Path(name).name
+            try:
+                self._fetch(part["url"], target, lambda n, b=before: progress(b + n, total), cancel)
+            except ProviderError as exc:
+                if not part.get("optional") or cancel.is_set():
+                    raise
+                self.log.info("Skipped optional download %s: %s", name, exc)
+                before += part["size"]
+                continue
             if part["kind"] == "tar":
-                self._extract(target, folder, cancel)
+                self._extract(target, folder, cancel, keep_tests=bool(part.get("keep_tests")))
                 target.unlink(missing_ok=True)
             else:
+                (folder / name).parent.mkdir(parents=True, exist_ok=True)
                 os.replace(target, folder / name)
             before += part["size"]
         shutil.rmtree(staging, ignore_errors=True)
@@ -1365,7 +1452,7 @@ class AddonManager:
             time.sleep(min(2 ** attempt, 20))
 
     @staticmethod
-    def _extract(archive: Path, dest: Path, cancel: threading.Event) -> None:
+    def _extract(archive: Path, dest: Path, cancel: threading.Event, keep_tests: bool = False) -> None:
         """Unpack a .tar.bz2, dropping its top folder and anything that tries to escape."""
         import tarfile
         with tarfile.open(archive, "r:*") as tar:
@@ -1376,7 +1463,7 @@ class AddonManager:
                 if len(parts) < 2 or any(p in ("..", "") for p in parts) or Path(member.name).is_absolute():
                     continue
                 rel = Path(*parts[1:])
-                if rel.parts[0] == "test_wavs":
+                if rel.parts[0] == "test_wavs" and not keep_tests:
                     continue
                 out = dest / rel
                 if member.isdir():
@@ -1429,7 +1516,13 @@ class NeuralVoice:
                     self._tts = self._create(full=False)
             return self._tts
 
+    last_used = 0.0
+
+    def loaded(self) -> bool:
+        return self._tts is not None
+
     def generate(self, text: str, voice: str, speed: float) -> tuple[bytes, int]:
+        self.last_used = time.monotonic()
         tts = self.load()
         audio = tts.generate(text, sid=KOKORO_SID.get(voice, 3), speed=float(speed))
         samples, rate = audio.samples, int(audio.sample_rate)
@@ -1440,6 +1533,125 @@ class NeuralVoice:
     def unload(self) -> None:
         with self._lock:
             self._tts = None
+
+
+def read_wav_float(path: Path, max_seconds: float = 12.0) -> tuple[list[float], int]:
+    """Any PCM .wav → mono float samples (first max_seconds) and its sample rate."""
+    with wave.open(str(path), "rb") as wf:
+        channels, width, rate = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+        raw = wf.readframes(min(wf.getnframes(), int(rate * max_seconds)))
+    if width == 2:
+        data = array.array("h")
+        data.frombytes(raw[: len(raw) - len(raw) % 2])
+        scale = 32768.0
+    elif width == 4:
+        data = array.array("i")
+        data.frombytes(raw[: len(raw) - len(raw) % 4])
+        scale = 2147483648.0
+    elif width == 1:
+        return [(b - 128) / 128.0 for b in raw[::channels]], rate
+    elif width == 3:
+        data = array.array("i", (int.from_bytes(raw[i:i + 3], "little", signed=True) for i in
+                                 range(0, len(raw) - len(raw) % 3, 3)))
+        scale = 8388608.0
+    else:
+        raise RuntimeError("unsupported .wav format")
+    if channels > 1:
+        data = data[::channels]
+    return [v / scale for v in data], rate
+
+
+class PocketVoice:
+    """Kyutai Pocket TTS through sherpa-onnx: clones a voice from a short recording. Loaded on first use."""
+
+    def __init__(self, folder: Path, user_dir: Path, log: Any):
+        self.folder = folder
+        self.user_dir = user_dir          # drop your own .wav files here to add voices
+        self.log = log
+        self._tts: Any = None
+        self._refs: dict[str, tuple[list[float], int]] = {}
+        self._lock = threading.Lock()
+        self.last_used = 0.0
+
+    def voices(self) -> list[tuple[str, str]]:
+        """[(key, label)] — Kyutai's voices, the samples that came with the model, then yours."""
+        out = [(key, label) for key, _p, label in POCKET_VOICE_FILES if (self.folder / "voices" / f"{key}.wav").exists()]
+        for wav in sorted((self.folder / "test_wavs").glob("*.wav")) if (self.folder / "test_wavs").is_dir() else []:
+            out.append((f"sample:{wav.stem}", f"{wav.stem.replace('_', ' ').title()} · sample"))
+        if self.user_dir.is_dir():
+            for wav in sorted(self.user_dir.glob("*.wav")):
+                out.append((f"mine:{wav.name}", f"{wav.stem.replace('_', ' ').title()} · your voice"))
+        return out
+
+    def path(self, key: str) -> Path | None:
+        if key.startswith("file:"):
+            p = Path(key[5:])
+        elif key.startswith("mine:"):
+            p = self.user_dir / key[5:]
+        elif key.startswith("sample:"):
+            p = self.folder / "test_wavs" / f"{key[7:]}.wav"
+        else:
+            p = self.folder / "voices" / f"{key}.wav"
+        return p if p.is_file() else None
+
+    def loaded(self) -> bool:
+        return self._tts is not None
+
+    def load(self) -> Any:
+        with self._lock:
+            if self._tts is None:
+                so = sherpa()
+                f = self.folder
+                pocket = _make(so.OfflineTtsPocketModelConfig, {
+                    "lm_flow": str(f / "lm_flow.int8.onnx"), "lm_main": str(f / "lm_main.int8.onnx"),
+                    "encoder": str(f / "encoder.onnx"), "decoder": str(f / "decoder.int8.onnx"),
+                    "text_conditioner": str(f / "text_conditioner.onnx"), "vocab_json": str(f / "vocab.json"),
+                    "token_scores_json": str(f / "token_scores.json"), "voice_embedding_cache_capacity": 16},
+                    optional=("voice_embedding_cache_capacity",))
+                threads = max(1, min(4, (os.cpu_count() or 2) // 2))
+                model = _make(so.OfflineTtsModelConfig, {"pocket": pocket, "num_threads": threads, "provider": "cpu",
+                                                         "debug": False}, optional=("debug", "provider"))
+                config = _make(so.OfflineTtsConfig, {"model": model, "max_num_sentences": 1},
+                               optional=("max_num_sentences",))
+                self._tts = so.OfflineTts(config)
+            return self._tts
+
+    def _reference(self, key: str) -> tuple[list[float], int]:
+        if key not in self._refs:
+            path = self.path(key) or next((self.path(k) for k, _l in self.voices() if self.path(k)), None)
+            if path is None:
+                raise RuntimeError("no voice recordings found — download Natural voices again")
+            self._refs[key] = read_wav_float(path)
+        return self._refs[key]
+
+    def generate(self, text: str, voice: str, speed: float) -> tuple[bytes, int]:
+        self.last_used = time.monotonic()
+        so = sherpa()
+        tts = self.load()
+        ref, rate = self._reference(voice)
+        gen = so.GenerationConfig()
+        gen.reference_audio = ref
+        gen.reference_sample_rate = rate
+        try:
+            gen.speed = float(speed)
+        except Exception:
+            pass
+        try:
+            audio = tts.generate(text, gen)
+        except TypeError:
+            if hasattr(tts, "generate_with_config"):
+                audio = tts.generate_with_config(text, gen)
+            else:
+                audio = tts.generate(text, generation_config=gen)
+        samples, out_rate = audio.samples, int(audio.sample_rate)
+        if samples is None or len(samples) == 0:
+            raise RuntimeError("the voice engine returned no audio")
+        return float_to_pcm16(samples), out_rate
+
+    def unload(self) -> None:
+        with self._lock:
+            self._tts = None
+            self._refs.clear()
 
 
 def float_to_pcm16(samples: Any) -> bytes:
@@ -1595,10 +1807,12 @@ class VoiceOut:
                     break
                 try:
                     item = self._synth(chunk, config)
-                except Exception as exc:  # neural voice trouble → Windows voice for the rest
-                    if config["engine"] == "neural":
-                        self.p.ctx.log.warning("Neural voice failed (%s); falling back to Windows voices", exc)
-                        config["engine"] = "windows"
+                except Exception as exc:  # voice trouble → the next voice engine for the rest
+                    if config["engine"] in ("natural", "neural"):
+                        fallback = "neural" if config["engine"] == "natural" and self.p.neural_ready() else "windows"
+                        self.p.ctx.log.warning("%s voice failed (%s); falling back to %s", config["engine"], exc,
+                                               fallback)
+                        config["engine"] = fallback
                         ui(self.p.voice_problem, str(exc))
                         try:
                             item = self._synth(chunk, config)
@@ -1637,6 +1851,8 @@ class VoiceOut:
         threading.Thread(target=consume, daemon=True, name="juno-play").start()
 
     def _synth(self, text: str, config: dict[str, Any]) -> tuple[bytes, int]:
+        if config["engine"] == "natural":
+            return self.p.natural.generate(text, config["natural"], config["speed"])
         if config["engine"] == "neural":
             return self.p.neural.generate(text, config["voice"], config["speed"])
         out = self.p.temp_dir / f"sapi-{uuid.uuid4().hex[:6]}.wav"
@@ -1662,6 +1878,7 @@ class VoiceChat:
         self.running = False
         self.muted = False
         self.state = "off"           # off | loading | listening | hearing | paused | muted
+        self.off_since = time.monotonic()
         self._stream: Any = None
         self._queue: "queue.Queue[Any]" = queue.Queue()
         self._recognizer: Any = None
@@ -1801,6 +2018,7 @@ class VoiceChat:
     def _set_state(self, state: str) -> None:
         if state != self.state:
             self.state = state
+            self.off_since = time.monotonic() if state == "off" else 0.0
             try:
                 self.p.ctx.call_in_ui(self.p.chat.refresh_mic)
             except Exception:
@@ -2551,7 +2769,11 @@ class Avatar:
             self._draw()
         except Exception:
             self.p.ctx.log.exception("Avatar tick failed")
-        self._after = self.app.after(33, self.tick)
+        from .orb import frame_delay
+        busy = self.mode != "idle" or bool(self.stroll) or bool(self.drag) or self.action is not None or \
+            now < self.hop_until or self.pose_r[0] != "rest" or self.pose_l[0] != "rest" or \
+            0 <= now - self.blink_start < 0.4
+        self._after = self.app.after(frame_delay(self.p.settings, busy), self.tick)
 
     def _update(self, now: float, dt: float) -> None:
         st = self.st
@@ -2936,12 +3158,12 @@ class ChatPanel:
         ctk.CTkSwitch(row, text="Speak replies", variable=speak,
                       command=lambda: p.set_muted(not speak.get())).grid(row=0, column=0, columnspan=2, sticky="w",
                                                                           padx=10, pady=(8, 4))
-        engines = {"Neural": "neural", "Windows": "windows"}
+        engines = {"Natural": "auto", "Kokoro": "neural", "Windows": "windows"}
         current = p.voice_config()["engine"]
-        seg = ctk.CTkSegmentedButton(row, values=list(engines), width=150,
+        seg = ctk.CTkSegmentedButton(row, values=list(engines), width=200,
                                      command=lambda v: (p.set_setting("voice_engine", engines[v]),
                                                         self._build_voice_row(), p.refresh_voice_ui()))
-        seg.set("Neural" if current == "neural" else "Windows")
+        seg.set({"natural": "Natural", "neural": "Kokoro"}.get(current, "Windows"))
         seg.grid(row=0, column=2, sticky="e", padx=10, pady=(8, 4))
 
         t.tag(ctk.CTkLabel(row, text="Voice", width=52, anchor="w"), "muted").grid(row=1, column=0, sticky="w",
@@ -2969,8 +3191,8 @@ class ChatPanel:
         slider.configure(command=moved)
         slider.grid(row=2, column=1, sticky="ew", pady=(3, 8))
         value.grid(row=2, column=2, sticky="e", padx=10, pady=(3, 8))
-        if current != "neural" and not p.addons.installed("voices"):
-            self._addon_offer(row, 3, "voices")
+        if current == "windows" and not p.addons.installed("natural"):
+            self._addon_offer(row, 3, "natural")
         t.apply(row)
 
     def _addon_offer(self, parent: Any, row: int, key: str) -> None:
@@ -3196,7 +3418,7 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "walk": True,
     "reduced_motion": False,
     "greet": True,
-    "power_on_start": False,     # Juno only runs when you switch her on
+    "power_on_start": False,     # Juno only runs when switched on
     "dnd": False,
     "home": None,
     "anchor": "right",
@@ -3205,7 +3427,7 @@ SETTING_DEFAULTS: dict[str, Any] = {
     "provider": "local",
     "local_size": "",
     "local_backend": "auto",
-    "local_idle": "15",
+    "local_idle": "5",
     "model": "claude-haiku-5-5",
     "base_url": "",
     "api_key": "",
@@ -3229,7 +3451,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 class Plugin:
     meta_title = "Desktop Companion"
-    meta_description = ("A character for your desktop, powered by a small AI that runs offline on your PC. Switch her "
+    meta_description = ("A character for your desktop, powered by a small AI that runs offline on your PC. Switch it "
                         "on when you want company: chat or talk out loud, paste or share images, pick a natural voice "
                         "and speed, and swap in new characters as packs.")
     meta_icon = "☺"
@@ -3258,6 +3480,7 @@ class Plugin:
         self.engine = LocalEngine(self)
         self.addons = AddonManager(local_root, ctx.log)
         self.neural = NeuralVoice(self.addons.folder("voices"), ctx.log)
+        self.natural = PocketVoice(self.addons.folder("natural"), ctx.data_dir / "voices", ctx.log)
         self.voice_out = VoiceOut(self)
         self.listener = VoiceChat(self)
         self._addon_cancel: threading.Event | None = None
@@ -3423,9 +3646,24 @@ class Plugin:
     def _idle_check(self) -> None:
         self._idle_after = self.ctx.app.after(60_000, self._idle_check)
         minutes = self.settings.get("local_idle", "15")
+        now = time.monotonic()
+        # voices and speech recognition are cheap to reload, so they're let go after a few quiet minutes
+        neural = getattr(self, "neural", None)
+        if neural is not None and neural.loaded() and now - neural.last_used > 300 and not self.voice_out.active:
+            self.ctx.log.info("Unloading the voice model (unused for 5 minutes)")
+            self.ctx.run_in_thread(neural.unload)
+        natural = getattr(self, "natural", None)
+        if natural is not None and natural.loaded() and now - natural.last_used > 300 and not self.voice_out.active:
+            self.ctx.log.info("Unloading the natural voice model (unused for 5 minutes)")
+            self.ctx.run_in_thread(natural.unload)
+        lst = self.listener
+        if getattr(lst, "_recognizer", None) is not None and lst.state == "off" and \
+                now - getattr(lst, "off_since", now) > 180:
+            self.ctx.log.info("Unloading speech recognition (mic off for 3 minutes)")
+            lst._recognizer = None
         if minutes == "never" or not self.engine.running() or self._busy:
             return
-        if time.monotonic() - self.engine.last_used > int(minutes) * 60:
+        if now - self.engine.last_used > int(minutes) * 60:
             self.ctx.log.info("Unloading the local AI after %s idle minutes", minutes)
             self.ctx.run_in_thread(self.engine.stop)
 
@@ -3438,7 +3676,7 @@ class Plugin:
         self.ctx.log.info("%s switched on", self.character["name"])
         self._startup()
         self._refresh_page(rebuild=True)
-        self.ctx.set_status(f"{self.character['name']} is on — right-click her for options.", "success")
+        self.ctx.set_status(f"{self.character['name']} is on — right-click the avatar for options.", "success")
 
     def power_off(self) -> None:
         if not self.powered:
@@ -3460,11 +3698,12 @@ class Plugin:
             self._quip_after = None
         self.ctx.run_in_thread(self._release_engines)
         self._refresh_page(rebuild=True)
-        self.ctx.set_status(f"{self.character['name']} is shut down — nothing of hers is running.")
+        self.ctx.set_status(f"{self.character['name']} is shut down — nothing of it is running.")
 
     def _release_engines(self) -> None:
         self.engine.stop()
         self.neural.unload()
+        self.natural.unload()
 
     def toggle_power(self) -> None:
         self.power_off() if self.powered else self.power_on()
@@ -3598,6 +3837,20 @@ class Plugin:
     def neural_ready(self) -> bool:
         return self.addons.installed("voices") and sherpa_ok()
 
+    def natural_ready(self) -> bool:
+        return self.addons.installed("natural") and sherpa_ok() and hasattr(sherpa(), "OfflineTtsPocketModelConfig")
+
+    def natural_voice(self) -> str:
+        voices = [k for k, _l in self.natural.voices()]
+        wanted = self.settings.get("natural_voice") or self.character["voice"].get("natural") or "alba"
+        if wanted.lower().endswith(".wav") and ":" not in wanted:      # a recording shipped in the character pack
+            folder = self.library.folders.get(self.character["id"])
+            if folder is not None and (folder / wanted).is_file():
+                return "file:" + str(folder / wanted)
+        if wanted.startswith("file:") and Path(wanted[5:]).is_file():
+            return wanted
+        return wanted if wanted in voices else (voices[0] if voices else wanted)
+
     def voice_speed(self) -> float:
         value = self.settings.get("voice_speed")
         if value is None:
@@ -3612,6 +3865,10 @@ class Plugin:
         choice = self.settings.get("voice_engine", "auto")
         if choice == "windows" and self.speech.available:
             engine = "windows"
+        elif choice == "neural" and self.neural_ready():
+            engine = "neural"
+        elif self.natural_ready():
+            engine = "natural"
         else:
             engine = "neural" if self.neural_ready() else "windows"
         speed = self.voice_speed()
@@ -3620,6 +3877,7 @@ class Plugin:
         return {
             "engine": engine,
             "voice": neural_voice if neural_voice in KOKORO_SID else "af_heart",
+            "natural": self.natural_voice() if engine == "natural" else "",
             "speed": speed,
             "sapi_voice": self.speech.pick(self.settings.get("voice_name") or "", voice.get("prefer", [])),
             "sapi_rate": max(-10, min(10, rate)),
@@ -3630,6 +3888,12 @@ class Plugin:
     def voice_choices(self) -> tuple[list[str], str, Callable[[str], None]]:
         """(menu labels, current label, setter) for whichever engine is active."""
         config = self.voice_config()
+        if config["engine"] == "natural":
+            pairs = self.natural.voices()
+            labels = [label for _k, label in pairs] or ["(no voices yet)"]
+            by_label = {label: key for key, label in pairs}
+            current = next((label for key, label in pairs if key == config["natural"]), labels[0])
+            return labels, current, lambda label: self.set_setting("natural_voice", by_label.get(label, ""))
         if config["engine"] == "neural" or (self.settings.get("voice_engine") == "neural"):
             labels = [label for _k, _s, label in KOKORO_VOICES]
             return labels, KOKORO_LABEL.get(config["voice"], labels[0]), \
@@ -3640,12 +3904,16 @@ class Plugin:
             lambda label: self.set_setting("voice_name", "" if label == default else label)
 
     def can_speak(self) -> bool:
-        return self.perm("voice") and not self.settings["muted"] and (self.speech.available or self.neural_ready())
+        return self.perm("voice") and not self.settings["muted"] and (self.speech.available or self.neural_ready()
+                                                                      or self.natural_ready())
 
     def preview_voice(self) -> None:
         if self.settings.get("voice_engine") == "neural" and not self.neural_ready():
             self.chat.offer_addon("voices")
             return
+        if self.settings.get("voice_engine") in ("auto", "natural", None) and not self.natural_ready() \
+                and not self.neural_ready():
+            self.chat.offer_addon("natural")
         lines = self.character["persona"]["greetings"] or ["Testing, one two."]
         self.voice_out.say(random.choice(lines))
 
@@ -3684,8 +3952,8 @@ class Plugin:
                             subtitle=self.character["name"], icon="♪")
             self.chat.hide_addon()
             self.update_addon_ui(key)
-            if key == "voices" and self.settings.get("voice_engine") != "windows":
-                self.set_setting("voice_engine", "auto")
+            if key in ("voices", "natural") and self.settings.get("voice_engine") != "windows":
+                self.set_setting("voice_engine", "auto" if key == "natural" else "neural")
             self.refresh_voice_ui()
             self._refresh_page(rebuild=True)
             if key == "listen" and self.powered and self._want_voice_chat:
@@ -4228,7 +4496,7 @@ class Plugin:
             return
         if not self.powered:
             self.top_status.configure(text=f"{self.character['name']} is switched off — nothing is running and "
-                                           f"no memory is used. Switch her on whenever you want company.")
+                                           f"no memory is used. Switch it on whenever you want company.")
             return
         bits = [f"{self.character['name']} is " + ("on your desktop" if self.avatar.visible else "hidden (still on)")]
         active = []
@@ -4505,17 +4773,19 @@ class Plugin:
 
         def voice(holder: Any) -> None:
             config = self.voice_config()
-            engines = {"Neural (natural)": "neural", "Windows voices": "windows"}
+            engines = {"Natural (best)": "auto", "Kokoro (fastest)": "neural", "Windows voices": "windows"}
             choice = self.settings.get("voice_engine", "auto")
             seg = ctk.CTkSegmentedButton(holder, values=list(engines),
                                          command=lambda v: (self.set_setting("voice_engine", engines[v]),
                                                             self._refresh_page(rebuild=True),
                                                             self.chat.refresh_controls()))
-            seg.set("Windows voices" if choice == "windows" else "Neural (natural)")
+            seg.set({"windows": "Windows voices", "neural": "Kokoro (fastest)"}.get(choice, "Natural (best)"))
             seg.pack(anchor="w")
-            if choice != "windows" and not self.neural_ready():
-                note = ("Neural voices need a one-time download — until then a Windows voice is used."
-                        if sherpa_ok() else "Neural voices need the voice engine from a newer Juno build.")
+            wants = "natural" if choice in ("auto", "natural") else "neural" if choice == "neural" else ""
+            if wants and config["engine"] != wants:
+                note = (f"{'Natural' if wants == 'natural' else 'Kokoro'} voices need a one-time download below — "
+                        f"until then {'Kokoro' if config['engine'] == 'neural' else 'a Windows voice'} is used."
+                        if sherpa_ok() else "These voices need the voice engine from a newer Juno build.")
                 t.tag(ctk.CTkLabel(holder, text=note, anchor="w"), "warning").pack(anchor="w", pady=(4, 0))
             line = t.tag(ctk.CTkFrame(holder, fg_color="transparent"), "transparent")
             line.pack(anchor="w", pady=(8, 2))
@@ -4553,11 +4823,13 @@ class Plugin:
                     sl.set(int(self.settings.get(key_) or 0))
                     sl.pack(side="left", padx=8)
         self._row(tab, row, "Voice", voice,
-                  "Neural voices sound natural and run offline after a one-time download. Speed applies to both.")
+                  "Natural voices sound the most human; Kokoro is lighter and faster. Both run offline after a "
+                  "one-time download. Add your own voice: put a 5–10 second .wav of someone talking in "
+                  "Juno's data folder ▸ voices (only voices you have permission to use).")
         row += 1
 
         self._addon_widgets = {}
-        for key_ in ("voices", "listen"):
+        for key_ in ("natural", "voices", "listen"):
             def addon(holder: Any, key_: str = key_) -> None:
                 holder.grid_columnconfigure(0, weight=1)
                 installed = self.addons.installed(key_)

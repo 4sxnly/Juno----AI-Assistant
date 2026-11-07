@@ -16,7 +16,7 @@ import math
 import random
 import time
 import tkinter as tk
-from typing import Any
+from typing import Any, Callable
 
 try:
     from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageTk
@@ -26,9 +26,24 @@ except Exception:  # pragma: no cover - Pillow is bundled
 ORB_STYLES = {
     "orb": ("Orb", "Wireframe globe in orbit rings"),
     "core": ("Core", "Arc-reactor rings around a pulsing core"),
-    "pulse": ("Pulse", "Circular equaliser that moves with her voice"),
+    "pulse": ("Pulse", "Circular equaliser that moves with the voice"),
 }
 OVERLAY_KEY = "#fe00fe"
+PERFORMANCE = {"smooth": "Smooth", "balanced": "Balanced", "saver": "Battery saver"}
+
+
+def frame_delay(settings: Any, active: bool) -> int:
+    """Milliseconds between avatar frames. Balanced runs slower while nothing is happening."""
+    mode = settings.get("performance", "balanced")
+    if settings.get("reduced_motion") or mode == "saver":
+        return 100 if not active else 66
+    if mode == "smooth":
+        return 33
+    return 40 if active else 66
+
+
+def glow_enabled(settings: Any) -> bool:
+    return settings.get("performance", "balanced") != "saver"
 
 
 def _hex(color: str) -> tuple[int, int, int]:
@@ -67,24 +82,59 @@ class OrbRenderer:
         """state: idle | listening | hearing | thinking | speaking. level: 0..1 speech loudness."""
         size = self.size
         overlay = background is not None
-        bg = _hex(background) if overlay else (0, 0, 0)
-        layer = Image.new("RGB", (size, size), bg)
+        if overlay:
+            fill = _hex(background)
+        else:   # with glow, half the card colour here + half from the blurred copy = the card colour
+            fill = tuple(v // 2 for v in self.bg) if glow else self.bg
+        layer = self._static_layer(background, fill).copy()
         draw = ImageDraw.Draw(layer)
         accent = self.alt if state in ("listening", "hearing") else self.bright
         if state == "thinking":
             accent = _mix(self.bright, self.alt, 0.5 + 0.5 * math.sin(t * 5))
+        self._lut = [_mix(self.dim, accent, i / 15) for i in range(16)]
         speed = {"thinking": 2.6, "speaking": 1.5, "hearing": 1.4}.get(state, 1.0)
-        if overlay:  # a dark puck so the form reads on any wallpaper
-            r = size * 0.47
-            c = size / 2
-            draw.ellipse((c - r, c - r, c + r, c + r), fill=self.core_fill, outline=self.mid, width=2)
         getattr(self, f"_draw_{self.style}")(draw, t, speed, accent, level, state)
         if overlay or not glow:
             return layer
-        halo = layer.filter(ImageFilter.GaussianBlur(radius=max(3, size // 70)))
-        base = Image.new("RGB", (size, size), self.bg)
-        out = ImageChops.add(ImageChops.add(base, halo), layer)
-        return ImageChops.multiply(out, self._scanlines())
+        # the glow is blurred at half size (4x cheaper, looks the same once scaled back up)
+        half = layer.reduce(2)
+        halo = half.filter(ImageFilter.GaussianBlur(radius=max(1.5, size / 140))).resize((size, size),
+                                                                                          Image.BILINEAR)
+        return ImageChops.multiply(ImageChops.add(halo, layer), self._scanlines())
+
+    def _static_layer(self, background: str | None, fill: tuple) -> Any:
+        """Everything that never moves (background, overlay puck, tick rings), drawn once."""
+        key = (background, fill, self.size, self.dim, self.mid)
+        cache = getattr(self, "_static_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        size = self.size
+        layer = Image.new("RGB", (size, size), fill)
+        draw = ImageDraw.Draw(layer)
+        if background is not None:   # a dark puck so the form reads on any wallpaper
+            r, c = size * 0.47, size / 2
+            draw.ellipse((c - r, c - r, c + r, c + r), fill=self.core_fill, outline=self.mid, width=2)
+        if self.style == "orb":
+            self._ticks(draw, size * 0.465, 96, 3, self.dim)
+        elif self.style == "core":
+            self._ticks(draw, size * 0.455, 120, 2, self.dim)
+        self._static_cache = (key, layer)
+        return layer
+
+    def _polyline(self, draw: Any, pts: list[tuple[float, float, float]], style: Callable[[float], tuple]) -> None:
+        """Draw a 3-D polyline in runs of equal colour/width (one PIL call per run instead of per segment)."""
+        run: list[tuple[float, float]] = []
+        current = None
+        for a, b in zip(pts, pts[1:]):
+            look = style((a[2] + b[2]) / 2)
+            if look != current:
+                if len(run) > 1:
+                    draw.line(run, fill=current[0], width=current[1], joint=None)
+                run = [(a[0], a[1])]
+                current = look
+            run.append((b[0], b[1]))
+        if len(run) > 1 and current is not None:
+            draw.line(run, fill=current[0], width=current[1])
 
     # ── shared bits ──────────────────────────────────────────────────────
     def _scanlines(self) -> Any:
@@ -108,11 +158,14 @@ class OrbRenderer:
     def _arc_ring(self, draw: Any, radius: float, segments: int, gap: float, rotate: float, color: tuple,
                   width: int) -> None:
         c = self.size / 2
-        box = (c - radius, c - radius, c + radius, c + radius)
-        span = 360 / segments
+        span = math.tau / segments
+        arc = span * (1 - gap)
+        steps = max(1, int(arc / 0.07))            # a point every ~4°
         for i in range(segments):
-            start = math.degrees(rotate) + i * span
-            draw.arc(box, start, start + span * (1 - gap), fill=color, width=width)
+            start = rotate + i * span
+            pts = [(c + math.cos(start + arc * k / steps) * radius, c + math.sin(start + arc * k / steps) * radius)
+                   for k in range(steps + 1)]
+            draw.line(pts, fill=color, width=width, joint="curve" if width > 2 else None)
 
     def _spikes(self, draw: Any, radius: float, level: float, t: float, color: tuple, count: int = 64) -> None:
         if level <= 0.02:
@@ -142,36 +195,33 @@ class OrbRenderer:
             y, z = y * ct - z * st, y * st + z * ct
             return c + r * x, c - r * y, z
 
-        def seg(p: tuple, q: tuple) -> None:
-            depth = (p[2] + q[2]) / 2
-            color = _mix(self.dim, accent, 0.25 + 0.75 * (depth * 0.5 + 0.5)) if depth > -0.1 else self.dim
-            draw.line((p[0], p[1], q[0], q[1]), fill=color, width=1 if depth < 0.3 else 2)
+        lut, dim = self._lut, self.dim
+
+        def look(depth: float) -> tuple:
+            if depth <= -0.1:
+                return dim, 1
+            return lut[min(15, int((0.25 + 0.75 * (depth * 0.5 + 0.5)) * 15))], 1 if depth < 0.3 else 2
 
         for m in range(12):  # meridians
             lon = m * math.pi / 6
-            pts = [project(-math.pi / 2 + k * math.pi / 20, lon) for k in range(21)]
-            for a, b in zip(pts, pts[1:]):
-                seg(a, b)
+            self._polyline(draw, [project(-math.pi / 2 + k * math.pi / 14, lon) for k in range(15)], look)
         for p in range(1, 8):  # parallels
             lat = -math.pi / 2 + p * math.pi / 8
-            pts = [project(lat, k * math.tau / 36) for k in range(37)]
-            for a, b in zip(pts, pts[1:]):
-                seg(a, b)
+            self._polyline(draw, [project(lat, k * math.tau / 28) for k in range(29)], look)
 
         # orbit rings with travelling sparks
         for idx, (radius, tilt_r, rate) in enumerate(((1.55, 0.35, 0.6), (1.85, -0.22, -0.4), (1.25, 1.2, 0.9))):
             cr, sr = math.cos(tilt_r), math.sin(tilt_r)
             pts = []
-            for k in range(73):
-                a = k * math.tau / 72
+            for k in range(49):
+                a = k * math.tau / 48
                 x, z = math.cos(a) * radius, math.sin(a) * radius
                 y = -z * sr
                 z = z * cr
                 pts.append((c + r * x, c - r * y * 0.35 - r * z * 0.12, z))
-            for a, b in zip(pts, pts[1:]):
-                behind = a[2] < 0 and abs(a[0] - c) < r
-                draw.line((a[0], a[1], b[0], b[1]), fill=self.dim if behind else _mix(self.mid, accent, 0.35),
-                          width=1)
+            ring_color = _mix(self.mid, accent, 0.35)
+            self._polyline(draw, [(x, y, 1.0 if (z < 0 and abs(x - c) < r) else 0.0) for x, y, z in pts],
+                           lambda behind: (self.dim, 1) if behind > 0.5 else (ring_color, 1))
             for s in range(2):
                 a = t * rate * speed + self._spark_seed[idx * 2 + s]
                 x, z = math.cos(a) * radius, math.sin(a) * radius
@@ -183,7 +233,6 @@ class OrbRenderer:
 
         # outer HUD
         self._arc_ring(draw, size * 0.44, 24, 0.35, -t * 0.15 * speed, self.mid, 2)
-        self._ticks(draw, size * 0.465, 96, 3, self.dim)
         if state == "thinking":
             self._arc_ring(draw, size * 0.40, 3, 0.75, t * 3.2, accent, 3)
         if state in ("listening", "hearing"):
@@ -201,7 +250,6 @@ class OrbRenderer:
         for i, (radius, segs, gap, rate, width) in enumerate(rings):
             color = _mix(self.mid, accent, 0.4 + 0.15 * i + 0.4 * level)
             self._arc_ring(draw, size * radius, segs, gap, t * rate * speed, color, width)
-        self._ticks(draw, size * 0.455, 120, 2, self.dim, rotate=t * 0.02)
         # spokes
         for i in range(6):
             a = i * math.tau / 6 + t * 0.2 * speed
@@ -296,6 +344,10 @@ class _ReactiveMixin:
         self._level += (target - self._level) * 0.5
         return self._level
 
+    def _active(self) -> bool:
+        return self.mode in ("thinking", "speaking") or self.speech is not None or \
+            self.core.listener.state == "hearing"
+
     def _state(self, listening: str) -> str:
         if self.mode in ("thinking", "speaking"):
             return self.mode
@@ -345,13 +397,14 @@ class StageOrb(_ReactiveMixin):
         self._after = None
         if not self.visible:
             return
+        delay = 250
         try:
-            if self.canvas.winfo_ismapped() and self.app.state() != "withdrawn":
+            if self.canvas.winfo_ismapped() and self.app.state() not in ("withdrawn", "iconic"):
                 self.draw()
+                delay = frame_delay(self.core.settings, self._active())
         except Exception:
             self.core.ctx.log.exception("Stage orb frame failed")
-        reduce = bool(self.core.settings.get("reduced_motion"))
-        self._after = self.app.after(66 if reduce else 33, self.tick)
+        self._after = self.app.after(delay, self.tick)
 
     def draw(self) -> None:
         if Image is None:
@@ -359,7 +412,8 @@ class StageOrb(_ReactiveMixin):
         t = time.monotonic() - self._t0
         if self.core.settings.get("reduced_motion"):
             t *= 0.35
-        image = self.renderer.render(t, self._state(self.core.listener.state), self._speech_level(), glow=True)
+        image = self.renderer.render(t, self._state(self.core.listener.state), self._speech_level(),
+                                     glow=glow_enabled(self.core.settings))
         if self._photo is None or self._photo.width() != image.width:
             self._photo = ImageTk.PhotoImage(image, master=self.canvas)
             self.canvas.delete("orb")
@@ -462,7 +516,8 @@ class OrbOverlay(_ReactiveMixin):
             self.draw()
         except Exception:
             self.core.ctx.log.exception("Orb overlay frame failed")
-        self._after = self.app.after(40, self.tick)
+        self._after = self.app.after(frame_delay(self.core.settings, self._active() or self._drag is not None),
+                                     self.tick)
 
     def draw(self) -> None:
         if Image is None:

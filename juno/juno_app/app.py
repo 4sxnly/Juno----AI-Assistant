@@ -35,7 +35,7 @@ from .base import (APP_NAME, IS_FROZEN, IS_WINDOWS, AppServices, SettingsStore, 
 from .core import JUNO_DEFAULTS, LISTEN_MODES, JunoContext, JunoCore
 from .integrations import (TEMPLATE_PACK, TEMPLATE_PY, Field, PackIntegration, Spotify, example_of,
                            load_python_integrations, normalize)
-from .orb import ORB_STYLES, OrbRenderer
+from .orb import ORB_STYLES, PERFORMANCE, OrbRenderer
 
 APP_VERSION = "1.0.0"
 B.APP_VERSION = APP_VERSION
@@ -132,20 +132,29 @@ class Wave(tk.Canvas):
         self.p, self.w, self.h, self.n = palette, width, height, bars
         self.levels = [0.1] * bars
         self.items = []
+        self.xs: list[float] = []
+        self.drawn: list[int] = [-1] * bars
+        self.color = palette["accent"]
         gap = width / bars
         for i in range(bars):
             x = gap * i + gap / 2
-            self.items.append(self.create_line(x, height / 2, x, height / 2, fill=palette["accent"], width=2))
+            self.xs.append(x)
+            self.items.append(self.create_line(x, height / 2, x, height / 2, fill=palette["accent"], width=2,
+                                               tags="bar"))
 
     def step(self, energy: float, color: str) -> None:
         t = time.monotonic()
+        mid = self.h / 2
         for i, item in enumerate(self.items):
             target = 0.08 + energy * (0.35 + 0.65 * abs(math.sin(i * 0.9 + t * 7) * math.sin(i * 0.37 - t * 3)))
             self.levels[i] += (target - self.levels[i]) * 0.4
-            half = max(1.0, self.levels[i] * self.h / 2)
-            x = self.coords(item)[0]
-            self.coords(item, x, self.h / 2 - half, x, self.h / 2 + half)
-            self.itemconfigure(item, fill=color)
+            half = int(max(1.0, self.levels[i] * mid))
+            if half != self.drawn[i]:      # only touch Tk when a bar actually changed
+                self.drawn[i] = half
+                self.coords(item, self.xs[i], mid - half, self.xs[i], mid + half)
+        if color != self.color:
+            self.color = color
+            self.itemconfigure("bar", fill=color)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -431,9 +440,16 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
             if key in self.pages:
                 self.pages[key].destroy()
             self.pages[key] = self._build_page(key)
-        for k, page in self.pages.items():
-            if k != key:
+        for k, page in list(self.pages.items()):
+            if k == key:
+                continue
+            if k in ("home", "chat"):
                 page.grid_remove()
+            else:      # other pages are rebuilt on demand — keeps memory and redraw work down
+                page.destroy()
+                del self.pages[k]
+        if old == "avatar" and key != "avatar":
+            self._previews = []
         self.pages[key].grid(row=0, column=0, sticky="nsew")
         self.current_page = key
         for k, btn in self.nav_buttons.items():
@@ -687,8 +703,9 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
         provider = core.settings["provider"]
         entries = [("On this PC", provider == "local", self._brain_summary()[0] if provider == "local" else "Standby"),
                    ("Claude API", provider == "anthropic", "Active" if provider == "anthropic" else "Not used"),
-                   ("Neural voice", core.addons.installed("voices"),
-                    "Installed" if core.addons.installed("voices") else "Not downloaded"),
+                   ("Natural voice", core.addons.installed("natural") or core.addons.installed("voices"),
+                    "Installed" if core.addons.installed("natural") else
+                    "Kokoro only" if core.addons.installed("voices") else "Not downloaded"),
                    ("Speech input", core.addons.installed("listen"),
                     "Installed" if core.addons.installed("listen") else "Not downloaded")]
         for n, (name, on, status) in enumerate(entries):
@@ -848,8 +865,8 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
                 line = t.tag(ctk.CTkFrame(box, fg_color="transparent"), "transparent")
                 line.grid(row=len(integ.fields) * 2, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
                 if integ.connected():
-                    if not integ.has_library_access():
-                        ctk.CTkButton(line, text="Reconnect (to use your library)", width=230,
+                    if integ.missing_scopes():
+                        ctk.CTkButton(line, text="Reconnect (new permissions)", width=230,
                                       command=lambda: self._spotify_connect(integ)).pack(side="left", padx=(0, 8))
                     else:
                         t.tag(ctk.CTkButton(line, text="⟳ Refresh library", width=140,
@@ -861,8 +878,50 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
                 else:
                     ctk.CTkButton(line, text="Connect Spotify account", width=200,
                                   command=lambda: self._spotify_connect(integ)).pack(side="left")
-                t.tag(ctk.CTkLabel(line, text="Needs Spotify Premium. Your Liked Songs and playlists are searched first.", anchor="w"),
-                      "muted").pack(side="left", padx=10)
+                t.tag(ctk.CTkLabel(line, text="Needs Spotify Premium. Your Liked Songs and playlists are searched "
+                                              "first.", anchor="w"), "muted").pack(side="left", padx=10)
+                self._vibes_editor(box, len(integ.fields) * 2 + 1, integ)
+
+    def _vibes_editor(self, box: Any, row: int, integ: Any) -> None:
+        """Spotify vibes: your own names for a sound ("maidcore" → artists)."""
+        t = self.theme
+        holder = t.tag(ctk.CTkFrame(box, fg_color="transparent"), "transparent")
+        holder.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10))
+        holder.grid_columnconfigure(1, weight=1)
+        t.tag(ctk.CTkLabel(holder, text="▣ VIBES", anchor="w", font=t.font(11, "bold")), "accent").grid(
+            row=0, column=0, sticky="w")
+        t.tag(ctk.CTkLabel(holder, text="Say “play <vibe>” and Juno plays a shuffled mix of these artists. You can "
+                                        "also say “when I say maidcore, play Yakui The Maid, Chikoi, Kichi”.",
+                           anchor="w", justify="left", wraplength=600, font=t.font(10)), "muted").grid(
+            row=0, column=1, columnspan=2, sticky="ew", padx=8)
+        r = 1
+        for vibe in integ.vibes():
+            t.tag(ctk.CTkLabel(holder, text=vibe["name"], anchor="w", width=140, font=t.font(12, "bold")),
+                  "title").grid(row=r, column=0, sticky="w", pady=2)
+            t.tag(ctk.CTkLabel(holder, text=", ".join(vibe["artists"]), anchor="w", justify="left",
+                               wraplength=520), "text").grid(row=r, column=1, sticky="ew", padx=8)
+
+            def remove(name: str = vibe["name"]) -> None:
+                integ.save_vibes([v for v in integ.vibes() if v["name"] != name])
+                self._rebuild("integrations")
+            t.tag(ctk.CTkButton(holder, text="✕", width=30, command=remove), "danger").grid(row=r, column=2)
+            r += 1
+        name = ctk.CTkEntry(holder, placeholder_text="vibe, e.g. maidcore", width=140)
+        name.grid(row=r, column=0, sticky="w", pady=(6, 0))
+        artists = ctk.CTkEntry(holder, placeholder_text="artists, separated by commas")
+        artists.grid(row=r, column=1, sticky="ew", padx=8, pady=(6, 0))
+
+        def add(_e: Any = None) -> None:
+            from .integ_spotify import split_artists
+            names = split_artists(artists.get())
+            if not name.get().strip() or not names:
+                self.set_status("Type a vibe name and at least one artist", "warning")
+                return
+            integ.set_vibe(name.get(), names)
+            self._rebuild("integrations")
+        artists.bind("<Return>", add)
+        t.tag(ctk.CTkButton(holder, text="＋ Add", width=70, command=add), "secondary").grid(row=r, column=2,
+                                                                                          pady=(6, 0))
 
     def _field_row(self, box: Any, n: int, integ: Any, f: Field) -> None:
         t, api = self.theme, self.core.integrations.api
@@ -1153,7 +1212,7 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
         seg.set(LISTEN_MODES.get(core.settings.get("listen_mode", "off"), "Off"))
         seg.grid(row=1, column=0, padx=12, pady=4, sticky="w")
         t.tag(ctk.CTkLabel(box, text="Off: only the mic button / hotkey.  Talk: everything you say goes to Juno.  "
-                                     "Hey Juno: always listening, but only acts when you start with her name. "
+                                     "Hey Juno: always listening, but only acts when you start with the wake word. "
                                      "All speech is recognised on your PC and never saved.", anchor="w",
                            justify="left", wraplength=640), "muted").grid(row=1, column=1, sticky="ew", padx=8)
         t.tag(ctk.CTkLabel(box, text="Wake word", anchor="w"), "text").grid(row=2, column=0, sticky="w", padx=12,
@@ -1243,6 +1302,16 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
                                                self.settings.set("core", "ui_volume", round(float(v), 2))))
         vol.set(self.theme.player.volume)
         vol.grid(row=0, column=1, sticky="w", padx=12)
+        line = t.tag(ctk.CTkFrame(body, fg_color="transparent"), "transparent")
+        line.grid(row=2, column=0, columnspan=2, sticky="w", pady=3)
+        t.tag(ctk.CTkLabel(line, text="Performance:"), "text").pack(side="left")
+        names = list(PERFORMANCE.values())
+        perf = ctk.CTkSegmentedButton(line, values=names, command=lambda v: core.set_setting(
+            "performance", next(k for k, n in PERFORMANCE.items() if n == v)))
+        perf.set(PERFORMANCE.get(core.settings.get("performance", "balanced"), "Balanced"))
+        perf.pack(side="left", padx=10)
+        t.tag(ctk.CTkLabel(line, text="Balanced slows the avatar while nothing's happening. Battery saver also "
+                                      "drops the glow.", font=t.font(10)), "muted").pack(side="left", padx=6)
         calm = ctk.BooleanVar(value=bool(core.settings.get("reduced_motion")))
         ctk.CTkSwitch(body, text="Reduce motion (slower avatar, no screen flicker)", variable=calm,
                       command=lambda: core.set_setting("reduced_motion", calm.get())).grid(row=1, column=0,
@@ -1330,6 +1399,9 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
 
     def _voice_summary(self) -> str:
         config = self.core.voice_config()
+        if config["engine"] == "natural":
+            label = dict(self.core.natural.voices()).get(config["natural"], config["natural"])
+            return label.split(" — ")[0].split(" · ")[0] + " · natural"
         if config["engine"] == "neural":
             return E.KOKORO_LABEL.get(config["voice"], config["voice"]).split(" — ")[0] + f" · {config['speed']:.2f}×"
         return "Windows voice" + ("" if self.core.speech.available else " (unavailable)")
@@ -1407,7 +1479,9 @@ class JunoApp(ctk.CTk, _DnDBase, AppServices):
                         self._paint_preview(canvas, renderer, t)
         except Exception:
             self.log.exception("animation failed")
-        self.after(70, self._anim)
+        core = self.core
+        busy = core.voice_out.active or core.listener.state in ("hearing", "listening") or core._busy
+        self.after(70 if busy else 140, self._anim)
 
     def _paint_preview(self, canvas: Any, renderer: OrbRenderer, t: float) -> None:
         from PIL import ImageTk
@@ -1754,6 +1828,11 @@ def main() -> int:
     B.set_app_user_model_id()
     B.configure_environment(paths, log)
     ctk.set_appearance_mode("dark")
+    try:   # CustomTkinter polls the OS theme every 30 ms and the DPI every 100 ms — Juno needs neither that often
+        ctk.AppearanceModeTracker.update_loop_interval = 2000
+        ctk.ScalingTracker.update_loop_interval = 1000
+    except Exception:
+        pass
     B._set_default_font()
     try:
         app = JunoApp(paths, log, start_mini="--mini" in sys.argv)

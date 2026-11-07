@@ -256,6 +256,35 @@ def send_keys(combo: str, repeat: int = 1) -> None:
             time.sleep(0.008)
 
 
+def focus_hwnd(hwnd: int) -> bool:
+    """Bring a window to the front from the background (Windows only lets the active app do that, so borrow
+    its input queue for a moment). True if it worked."""
+    if not IS_WINDOWS or not hwnd:
+        return False
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    if not user32.IsWindow(hwnd):
+        return False
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)                      # SW_RESTORE
+    fg = user32.GetForegroundWindow()
+    if fg == hwnd:
+        return True
+    me, them = kernel32.GetCurrentThreadId(), user32.GetWindowThreadProcessId(fg, None)
+    attached = bool(them and them != me and user32.AttachThreadInput(me, them, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(me, them, False)
+    if user32.GetForegroundWindow() != hwnd:
+        user32.keybd_event(0x87, 0, 0, 0)               # a harmless F24 tap counts as "user input"
+        user32.keybd_event(0x87, 0, 2, 0)
+        user32.SetForegroundWindow(hwnd)
+    time.sleep(0.12)
+    return user32.GetForegroundWindow() == hwnd
+
+
 # ── installed apps (Start menu) ─────────────────────────────────────────────
 class AppIndex:
     """Start-menu shortcuts, so "open Blender" works without any setup."""
@@ -316,7 +345,7 @@ class AppIndex:
 
 
 # ── phrase patterns ─────────────────────────────────────────────────────────
-FILLER_RE = re.compile(r"^(?:(?:hey|hi|ok|okay|yo)\s+)?(?:{wake})\b[\s,.:!-]*", re.I)
+FILLER_RE = re.compile(r"^(?:(?:hey|hi|ok|okay|yo|ayo|aye|ay|oi|aight|alright)\s+)?(?:{wake})\b[\s,.:!-]*", re.I)
 POLITE_RE = re.compile(r"^(?:(?:please|can you|could you|would you|will you|can u|go ahead and|i want you to|"
                        r"i'd like you to|i need you to|just)\s+)+", re.I)
 TAIL_RE = re.compile(r"\s+(?:please|for me|thanks|thank you|now|right now)$", re.I)
@@ -330,13 +359,102 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# ── casual speech → plain commands ──────────────────────────────────────────
+# Only command words are touched; anything that could be part of a song or app name is left alone.
+WORD_FIXES = {
+    "pls": "please", "plz": "please", "plss": "please", "pleas": "please", "pleez": "please", "yall": "you all",
+    "whats": "what's", "wats": "what's", "wuts": "what's",
+    "wut": "what", "wat": "what", "whos": "who's", "wheres": "where's", "hows": "how's", "thats": "that's",
+    "dont": "don't", "cant": "can't", "wont": "won't", "ive": "i've", "lets": "let's",
+    "wanna": "want to", "gonna": "going to", "gotta": "got to", "lemme": "let me", "gimme": "give me",
+    "dis": "this", "dat": "that", "teh": "the", "smth": "something",
+    "sumn": "something", "somethin": "something", "nothin": "nothing", "msg": "message", "msgs": "messages",
+    "vol": "volume", "rn": "right now", "tmrw": "tomorrow", "thx": "thanks", "ty": "thanks", "tysm": "thanks",
+    "cuz": "because", "bc": "because", "coz": "because", "abt": "about", "pic": "picture",
+    "spotfy": "spotify", "spotiy": "spotify", "spotifiy": "spotify", "spoitfy": "spotify", "sptify": "spotify",
+    "spotif": "spotify", "spotifyy": "spotify", "discrod": "discord", "dicord": "discord", "disocrd": "discord",
+    "discor": "discord", "youtbe": "youtube", "yotube": "youtube", "youtub": "youtube", "yt": "youtube",
+    "firefx": "firefox", "firfox": "firefox", "chorme": "chrome", "crome": "chrome", "blendr": "blender",
+    "roblx": "roblox", "robox": "roblox", "playist": "playlist", "plyalist": "playlist", "que": "queue",
+    "queu": "queue", "shuffel": "shuffle", "volum": "volume", "skipp": "skip",
+}
+LEAD_FILLER = ("yo", "ayo", "ay", "aye", "ey", "oi", "hey", "hi", "ok", "okay", "k", "kk", "aight", "alright",
+               "ight", "so", "um", "uh", "uhh", "umm", "hmm", "bro", "bruh", "dude", "man", "fam", "bestie",
+               "twin", "gang", "ngl", "lowkey", "highkey", "fr", "frfr", "deadass", "honestly", "actually",
+               "lol", "lmao", "lmfao", "please", "real quick", "quick", "quickly", "oh", "and", "also", "now",
+               "imma need you to", "i need you to", "i want you to", "i'd like you to", "i would like you to",
+               "you should", "can you", "could you", "can u", "could u", "would u", "will u", "cud u", "wud u", "would you", "will you", "can ya", "could ya", "cud you",
+               "wud you", "mind", "go ahead and", "just", "pretty please", "do me a favor and", "yo can you")
+TAIL_FILLER = ("lol", "lmao", "lmfao", "xd", "right now", "real quick", "rq", "asap", "bro", "bruh", "dude",
+               "fam", "gang", "twin", "man", "please", "pretty please", "thanks", "thank you", "fr", "frfr", "ong",
+               "ngl", "n shi", "n shit", "and shit", "and stuff", "n stuff", "or sum", "or something", "or whatever",
+               "for me", "4 me", "k", "ok", "okay", "now", "quick", "quickly", "thx", "pls", "plz", "rn",
+               "already", "again pls", "my guy", "homie", "g", "bestie", "real fast", "yeah", "ya know")
+VERB_FIXES = [   # (casual start, plain start) — applied once, at the start of the command
+    (r"(?:can i get|lemme get|let me get|gimme|give me|play me|i want to hear|i wanna hear|let me hear|"
+     r"lemme hear|throw on|bump|blast|spin|run me|crank|i'm tryna hear|tryna hear) ", "play "),
+    (r"(?:open up|boot up|start up|fire up|pull up|hop on|get on|load up) ", "open "),
+    (r"(?:close out|shut down|shut off|get rid of|kill off) ", "close "),
+    (r"(?:skip (?:this|that|it)(?: one| song| track| shit| trash)?|next one|next song pls|nah next|next)$", "skip"),
+    (r"(?:turn it up|crank it|make it louder|louder pls)$", "volume up"),
+    (r"(?:turn it down|make it quieter|too loud|lower it)$", "volume down"),
+    (r"(?:what(?:'s| is) this song|what song is this|who sings this|who's this)(?: by)?$", "what's playing"),
+    (r"(?:what(?:'s| is) the time|time check|what time is it)$", "what time is it"),
+    (r"(?:look up|search up) ", "search up "),
+    (r"(?:hit up|text|msg|dm) (\S+) (?:on discord )?(?:and )?(?:say|saying|tell (?:them|him|her)) ",
+     r"message \1 on discord saying "),
+]
+
+
+def _squash(word: str) -> str:
+    """'pleaseeee' → 'please', 'yooo' → 'yo' (only used to recognise filler words)."""
+    return re.sub(r"(.)\1{2,}", r"\1", word)
+
+
+def decasual(text: str) -> str:
+    """'yo juno can u throw on sum yeat rn lol' → 'can you play some yeat' (wake word handled by the caller)."""
+    words = [WORD_FIXES.get(_squash(w), w) for w in text.split()]
+    text = " ".join(words)
+    text = re.sub(r"\b2 (the|my|a)\b", r"to \1", text)
+    for _ in range(4):           # peel fillers off both ends
+        before = text
+        for f in sorted(LEAD_FILLER, key=len, reverse=True):
+            if text == f or text.startswith(f + " "):
+                rest = text[len(f):].strip()
+                if rest:
+                    text = rest
+                break
+        for f in sorted(TAIL_FILLER, key=len, reverse=True):
+            if text.endswith(" " + f):
+                text = text[: -len(f) - 1].strip()
+                break
+        squashed = " ".join(_squash(w) for w in text.split()[:1]) + (" " + " ".join(text.split()[1:])
+                                                                     if len(text.split()) > 1 else "")
+        if squashed != text and squashed.split()[0] in LEAD_FILLER:
+            text = squashed
+        if text == before:
+            break
+    for pattern, repl in VERB_FIXES:
+        new = re.sub("^" + pattern, repl, text)
+        if new != text:
+            text = new.strip()
+            break
+    return re.sub(r"^(play|put on|shuffle|queue) (?:sum|sm) (?=[a-z])", r"\1 some ", text)   # not "Sum 41"
+
+
 def clean_command(text: str, wake: str = "juno") -> str:
-    """'Hey Juno, could you please open Spotify for me?' → 'open spotify'."""
+    """'Hey Juno, could you please open Spotify for me?' → 'open spotify'. Slang and typos are smoothed out."""
     text = normalize(text)
-    text = re.sub(FILLER_RE.pattern.replace("{wake}", re.escape(wake.lower())), "", text, flags=re.I).strip()
-    for _ in range(3):
-        text = POLITE_RE.sub("", text).strip()
-        text = TAIL_RE.sub("", text).strip()
+    text = re.sub(r"[()]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    wake_re = re.escape(wake.lower())
+    for _ in range(2):
+        text = decasual(text)
+        text = re.sub(FILLER_RE.pattern.replace("{wake}", wake_re), "", text, flags=re.I).strip()
+        text = re.sub(rf"[\s,]+{wake_re}$", "", text).strip()          # "...play yeat juno"
+        for _ in range(3):
+            text = POLITE_RE.sub("", text).strip()
+            text = TAIL_RE.sub("", text).strip()
     return text
 
 
@@ -444,6 +562,7 @@ class Match:
     action: Action
     params: dict[str, str]
     via: str = "pattern"          # pattern | phrase | ai
+    skip: int = 0                 # how many better matches were passed over (for fall-through)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -468,7 +587,7 @@ class Registry:
         self.stop_all()
         self.items.clear()
         self.errors.clear()
-        for cls in BUILTINS:
+        for cls in builtins():
             self._add(cls())
         for folder in (self.core.ctx.paths.plugins_dir, self.user_dir):   # shipped extras, then yours
             if folder.is_dir():
@@ -550,7 +669,8 @@ class Registry:
                     continue
                 params = {k: v.strip() for k, v in m.groupdict().items() if v}
                 params["_text"] = command
-                return Match(integ, action, params, "phrase" if integ.id == "phrases" else "pattern")
+                params["_raw"] = text
+                return Match(integ, action, params, "phrase" if integ.id == "phrases" else "pattern", seen)
         return None
 
     def mentioned(self, text: str) -> Integration | None:
@@ -847,9 +967,10 @@ class Media(Integration):
                                                    "(pause|resume|unpause|play)", "stop [the] music", "keep playing"],
                    k("media_play_pause", "Play/pause."),
                    background=False),
-            Action("next", "Next track", ["(next|skip) [this] [song|track]", "skip it", "play the next song"],
+            Action("next", "Next track", ["(next|skip) [this] [song|track]", "skip it", "play [the] next [song|track|one]"],
                    k("media_next", "Skipped."), background=False),
-            Action("prev", "Previous track", ["(previous|last|go back a) (song|track)", "play the previous song"],
+            Action("prev", "Previous track", ["(previous|last|go back a) (song|track)",
+                                              "play [the] (previous|last) (song|track|one)"],
                    k("media_prev", "Previous track."), background=False),
         ]
 
@@ -1043,10 +1164,25 @@ class RobloxStudio(Integration):
         return ActionResult(f"Opened {hit.name} in Roblox Studio.")
 
 
-from .integ_spotify import Spotify  # noqa: E402  (they import the framework above)
-from .integ_discord import Discord, recent_discord_notifications  # noqa: E402,F401
+# The bigger built-ins live in their own files (integ_*.py). They import this framework, so they're loaded on
+# first use rather than at the top of this file.
+_LATE = {"Spotify": ("integ_spotify", "Spotify"), "Discord": ("integ_discord", "Discord"),
+         "recent_discord_notifications": ("integ_discord", "recent_discord_notifications"),
+         "Browser": ("integ_browser", "Browser")}
 
-BUILTINS: list[type[Integration]] = [Phrases, Apps, System, Media, Spotify, Google, Discord, Blender, RobloxStudio]
+
+def __getattr__(name: str) -> Any:          # `from .integrations import Spotify` still works
+    if name in _LATE:
+        import importlib
+        module, attr = _LATE[name]
+        return getattr(importlib.import_module(f".{module}", __package__), attr)
+    raise AttributeError(name)
+
+
+def builtins() -> list[type[Integration]]:
+    late = __getattr__
+    return [Phrases, Apps, System, Media, late("Spotify"), Google, late("Browser"), late("Discord"), Blender,
+            RobloxStudio]
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -1921,7 +1921,7 @@ class ToastManager:
 
 
 # ── in-app updates ──────────────────────────────────────────────────────────
-UPDATE_REPO_DEFAULT = "4sxnly/multi-tool"
+UPDATE_REPO_DEFAULT = "4sxnly/Juno----AI-Assistant"
 UPDATE_BRANCH_DEFAULT = "main"
 # repo paths that only change by rebuilding the installer (embedded Python, libraries, engines)
 INSTALLER_PATHS = ("requirements.txt", "launcher.py", "build/", ".github/workflows/build.yml", "assets/")
@@ -2369,7 +2369,10 @@ class AppServices:
             try:
                 result = fn(*args, **kwargs)
             except BaseException as exc:
-                self.log.exception("Background task %s failed", name)
+                if isinstance(exc, LookupError):      # "not mine" from a command — the router tries the next one
+                    self.log.info("Background task %s passed: %s", name, exc)
+                else:
+                    self.log.exception("Background task %s failed", name)
                 if on_error is not None:
                     self._ui_queue.put((on_error, (exc,), {}))
                 else:

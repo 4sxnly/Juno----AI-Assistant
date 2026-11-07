@@ -32,6 +32,7 @@ JUNO_DEFAULTS: dict[str, Any] = {
     "start_mini": False,
     "boot": True,
     "speak_actions": True,
+    "performance": "balanced",    # smooth | balanced | saver
 }
 LISTEN_MODES = {"off": "Off", "talk": "Talk", "wake": "Hey Juno"}
 
@@ -544,6 +545,16 @@ class JunoCore(E.Plugin):
             self.finish_action(integ, action.title, result, spoken)
 
         def failed(exc: BaseException) -> None:
+            if isinstance(exc, LookupError) and match.via != "ai":   # "not mine after all" → next best command
+                nxt = self.integrations.match(text, skip=match.skip + 1)
+                if nxt is not None:
+                    self.run_action(nxt, text, spoken, echo=False)
+                    return
+                named = self.integrations.mentioned(text)
+                if named is not None and self._brain_ready():
+                    self.avatar.mode = "idle"
+                    self.ai_pick_action(named, text, spoken, echo=False)
+                    return
             message = str(exc) or exc.__class__.__name__
             self.finish_action(integ, action.title, ActionResult(f"Couldn't do that: {message}", ok=False), spoken)
 
@@ -582,7 +593,7 @@ class JunoCore(E.Plugin):
             return bool(self.api_key())
         return provider == "openai"
 
-    def ai_pick_action(self, integ: Integration, text: str, spoken: bool) -> None:
+    def ai_pick_action(self, integ: Integration, text: str, spoken: bool, echo: bool = True) -> None:
         """You named an integration but no command pattern fit: let the brain pick ONE of its actions."""
         if self._busy:
             self.chat.system("Still working on the last request — press ■ to cancel it.")
@@ -593,11 +604,13 @@ class JunoCore(E.Plugin):
             params = ", ".join(f"{k} ({v})" for k, v in a.params.items()) or "none"
             lines.append(f"- {a.id}: {a.title}. {a.description} Params: {params}. "
                          f"Example: {(a.examples or a.patterns)[0]}")
-        system = (f"You map a user's request onto ONE action of the '{integ.name}' integration. Reply with ONLY a "
+        system = (f"You map a user's request onto ONE action of the '{integ.name}' integration. The user may write "
+                  f"casually, with slang and typos — work out what they mean. Reply with ONLY a "
                   f"JSON object like {{\"action\": \"id\", \"params\": {{\"name\": \"value\"}}}}. If the request "
                   f"isn't really asking for one of these actions, reply {{\"action\": \"none\"}}.\nActions:\n"
                   + "\n".join(lines))
-        self._echo_user(text, spoken)
+        if echo:
+            self._echo_user(text, spoken)
         self._busy = True
         self.avatar.mode = "thinking"
         self.chat.set_status("Working out what you want…")
