@@ -1,0 +1,10 @@
+# Bundled INTO Juno.exe by PyInstaller (juno/build/juno.spec). Users never install any of this.
+# Changing this file makes GitHub build a new Juno installer (the app offers it in Settings ▸ Updates).
+customtkinter>=5.2.2
+tkinterdnd2>=0.4.2
+Pillow>=11.0                              # avatars, screenshots, images in chat
+pywin32>=306; sys_platform == "win32"     # Windows voices, shortcuts, window capture
+numpy>=1.26                               # audio buffers
+sounddevice>=0.4.7                        # microphone + speaker (ships PortAudio)
+sherpa-onnx>=1.12                         # offline neural voices, speech recognition, voice detection
+pyinstaller>=6.10
